@@ -113,27 +113,7 @@ class Database:
             
         except Exception as e:
             logger.error(f"Error getting unprocessed IPs: {e}")
-            
-            # Fallback method: use a simpler query
-            try:
-                logger.info("Trying fallback query for getting IPs")
-                fallback_query = f"""
-                SELECT ip FROM (
-                    SELECT DISTINCT ip_address AS ip
-                    FROM nebula.peer_data
-                    WHERE ip_address != ''
-                )
-                WHERE ip NOT IN (
-                    SELECT ip FROM {CLICKHOUSE_DATABASE}.{IP_INFO_TABLE}
-                )
-                LIMIT {limit}
-                """
-                
-                result = self.execute(fallback_query)
-                return [row[0] for row in result]
-            except Exception as fallback_error:
-                logger.error(f"Fallback query also failed: {fallback_error}")
-                return []
+            return []
 
     def save_ip_info(self, ip_info: Dict[str, Any], success: bool = True, error: str = '') -> None:
         """Save IP information to ClickHouse."""
