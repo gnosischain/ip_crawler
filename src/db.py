@@ -10,8 +10,9 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from src.config import (
     CLICKHOUSE_HOST, CLICKHOUSE_PORT, CLICKHOUSE_USER, 
     CLICKHOUSE_PASSWORD, CLICKHOUSE_DATABASE, CLICKHOUSE_SECURE,
-    IP_INFO_TABLE
+    IP_INFO_TABLE, LOG_PATH
 )
+from src.partition_tracker import PartitionTracker
 
 # Set up logger
 logger = logging.getLogger('db')
@@ -20,6 +21,10 @@ class Database:
     def __init__(self):
         self.client = self._create_client()
         logger.info(f"Connected to ClickHouse at {CLICKHOUSE_HOST}:{CLICKHOUSE_PORT}")
+        
+        # Initialize the partition tracker
+        self.tracker = PartitionTracker(os.path.join(LOG_PATH, "partition_state.json"))
+        logger.info("Initialized partition tracker")
 
     def _create_client(self) -> Client:
         """Create and return a ClickHouse client."""
@@ -80,36 +85,35 @@ class Database:
             raise
 
     def get_unprocessed_ips(self, limit: int) -> List[str]:
-        """Get IPs that haven't been processed yet."""
+        """Get IPs that haven't been processed yet using partition-based approach."""
         try:
-            # First, create a temporary table with IPs from the source
-            self.execute_command("""
-            CREATE TEMPORARY TABLE IF NOT EXISTS temp_ips (ip String) ENGINE = Memory
-            """)
+            # Get the query for the next partition to process
+            query_template = self.tracker.get_next_partition_query()
             
-            # Insert IPs directly from a simplified query to avoid Dynamic type issues
-            self.execute_command("""
-            INSERT INTO temp_ips
-            SELECT DISTINCT toString(ip) AS ip
-            FROM (
-                SELECT JSONExtractString(toString(peer_properties), 'ip') AS ip
-                FROM nebula.visits
-                WHERE toString(peer_properties) LIKE '%064%'
-            )
-            WHERE ip != ''
-            """)
+            if not query_template:
+                logger.info("No more partitions to process at this time")
+                return []
             
-            # Query the temporary table, excluding IPs that are already processed
-            query = f"""
-            SELECT ip FROM temp_ips
-            WHERE ip NOT IN (
-                SELECT ip FROM {CLICKHOUSE_DATABASE}.{IP_INFO_TABLE}
-            )
-            LIMIT {limit}
-            """
+            # Format the query with the batch size
+            query = query_template.format(batch_size=limit)
             
+            # Execute the query directly without creating a temporary table
             result = self.execute(query)
-            return [row[0] for row in result]
+            ips = [row[0] for row in result]
+            
+            # If we got fewer results than the limit, this partition is complete
+            if len(ips) < limit:
+                logger.info(f"Partition completed with {len(ips)} IPs")
+                self.tracker.mark_current_complete()
+            
+            # Filter out IPs we've already processed
+            unprocessed_ips = []
+            for ip in ips:
+                if not self.check_ip_exists(ip):
+                    unprocessed_ips.append(ip)
+            
+            logger.info(f"Found {len(unprocessed_ips)} unprocessed IPs out of {len(ips)} total")
+            return unprocessed_ips
             
         except Exception as e:
             logger.error(f"Error getting unprocessed IPs: {e}")
@@ -163,6 +167,10 @@ class Database:
         """
         result = self.execute(query)
         return len(result) > 0
+        
+    def update_fork_digests(self, new_digests: List[str]) -> None:
+        """Update the fork digests in the tracker."""
+        self.tracker.update_fork_digests(new_digests)
 
     def get_db_stats(self) -> Dict[str, Union[int, float]]:
         """Get statistics about the database."""

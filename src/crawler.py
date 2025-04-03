@@ -36,12 +36,31 @@ logger = logging.getLogger('ip_crawler')
 with open(os.path.join(LOG_PATH, 'health.log'), 'w') as f:
     f.write(f"Crawler started at {datetime.now().isoformat()}")
 
+# Default fork digests to track
+DEFAULT_FORK_DIGESTS = [
+    '0x56fdb5e0', '0x824be431', '0x21a6f836', 
+    '0x3ebfd484', '0x7d5aab40', '0xf9ab5f85'
+]
+
 class IPInfoCrawler:
     def __init__(self):
         self.db = Database()
         self.running = True
         self.setup_signal_handlers()
-        logger.info("IP Info Crawler initialized")
+        
+        # Load fork digests from environment or use defaults
+        fork_digests_env = os.environ.get('FORK_DIGESTS', '')
+        if fork_digests_env and fork_digests_env.strip():
+            self.fork_digests = [d.strip() for d in fork_digests_env.split(',') if d.strip()]
+        else:
+            self.fork_digests = DEFAULT_FORK_DIGESTS.copy()
+        
+        # Update the tracker with our initial fork digests if they're different
+        tracker_digests = self.db.tracker.fork_digests
+        if sorted(self.fork_digests) != sorted(tracker_digests):
+            self.db.update_fork_digests(self.fork_digests)
+        
+        logger.info(f"IP Info Crawler initialized with fork digests: {self.fork_digests}")
         
         # Log rate limit settings
         if RATE_LIMIT_SECONDS > 0:
@@ -126,20 +145,36 @@ class IPInfoCrawler:
         logger.info("Starting IP Info crawler loop")
         
         batch_count = 0
+        empty_result_count = 0
         while self.running:
             try:
                 # Update health check file
                 with open(os.path.join(LOG_PATH, 'health.log'), 'w') as f:
                     f.write(f"Crawler running at {datetime.now().isoformat()}")
                 
+                # Check for fork digest updates in environment variable
+                fork_digests_env = os.environ.get('FORK_DIGESTS', '')
+                if fork_digests_env and fork_digests_env.strip():
+                    new_fork_digests = [d.strip() for d in fork_digests_env.split(',') if d.strip()]
+                    if new_fork_digests and sorted(new_fork_digests) != sorted(self.fork_digests):
+                        logger.info(f"Updating fork digests from {self.fork_digests} to {new_fork_digests}")
+                        self.fork_digests = new_fork_digests
+                        self.db.update_fork_digests(self.fork_digests)
+                
                 # Get batch of unprocessed IPs
                 ips = self.db.get_unprocessed_ips(BATCH_SIZE)
                 
                 if not ips:
-                    logger.info("No new IPs to process. Sleeping...")
-                    time.sleep(SLEEP_INTERVAL)
+                    empty_result_count += 1
+                    logger.info(f"No new IPs to process. Sleeping... (empty count: {empty_result_count})")
+                    
+                    # If we've had multiple empty results, wait longer
+                    sleep_time = min(SLEEP_INTERVAL * (1 + empty_result_count // 5), 300)  # Max 5 minutes
+                    time.sleep(sleep_time)
                     continue
                 
+                # Reset empty result counter when we find IPs
+                empty_result_count = 0
                 batch_count += 1
                 logger.info(f"Processing batch #{batch_count} with {len(ips)} IPs")
                 

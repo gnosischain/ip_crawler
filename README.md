@@ -1,6 +1,6 @@
 # IP Info Crawler
 
-A robust service that continuously fetches IP address information from ipinfo.io and stores it in a ClickHouse database.
+A service that continuously fetches IP address information from ipinfo.io and stores it in a ClickHouse database.
 
 ## Features
 
@@ -9,6 +9,8 @@ A robust service that continuously fetches IP address information from ipinfo.io
 - Handles rate limiting for the ipinfo.io API (up to 10 requests per second)
 - Implements retry logic and error handling
 - Processes IPs in batches for efficiency
+- Processes large tables incrementally by month to avoid memory issues
+- Configurable fork digests for filtering IP addresses
 - Dockerized for easy deployment
 - Automatically sources IPs from your existing database tables
 
@@ -60,6 +62,7 @@ All configuration is handled through environment variables in the `.env` file:
 - `REQUEST_TIMEOUT` - Seconds for API requests timeout (default: 10)
 - `MAX_RETRIES` - Maximum number of retries for failed requests (default: 3)
 - `RETRY_DELAY` - Seconds between retries (default: 5)
+- `FORK_DIGESTS` - Comma-separated list of fork digests to track (default: 0x56fdb5e0,0x824be431,0x21a6f836,0x3ebfd484,0x7d5aab40,0xf9ab5f85)
 
 ## Database Schema
 
@@ -94,25 +97,37 @@ ORDER BY (ip, updated_at);
 
 ## Adding IPs to Process
 
-The crawler automatically fetches IPs from the `nebula.visits` table that haven't been processed yet. It uses the query:
+The crawler automatically fetches IPs from the `nebula.visits` table that haven't been processed yet. It uses queries that process the table incrementally by month to avoid memory issues. The core filtering logic looks for:
 
 ```sql
-WITH source AS (
-    SELECT DISTINCT toString(ip) AS ip
-    FROM (
-        SELECT JSONExtractString(toString(peer_properties), 'ip') AS ip
-        FROM nebula.visits
-        WHERE toString(peer_properties) LIKE '%064%'
+SELECT DISTINCT toString(ip) AS ip
+FROM (
+    SELECT JSONExtractString(toString(peer_properties), 'ip') AS ip
+    FROM nebula.visits
+    WHERE toStartOfMonth(visit_started_at) = toDate('YYYY-MM-01')
+    AND (
+        JSONExtractString(toString(peer_properties), 'fork_digest') IN ('0x56fdb5e0', '0x824be431', '0x21a6f836', '0x3ebfd484', '0x7d5aab40', '0xf9ab5f85')
+        OR JSONExtractString(toString(peer_properties), 'next_fork_version') LIKE '%064%'
     )
-    WHERE ip != ''
 )
-
-SELECT ip FROM source
-WHERE ip NOT IN (
-    SELECT ip FROM crawlers_data.ipinfo
-)
+WHERE ip != ''
 LIMIT {batch_size}
 ```
+
+## Incremental Processing
+
+To handle very large tables without encountering memory limitations, the crawler:
+
+1. Processes data month by month using the table's time partitioning
+2. Maintains state in a JSON file to track which months have been processed
+3. Automatically resumes from where it left off if restarted
+
+## Updating Fork Digests
+
+The list of fork digests to track can be updated in two ways:
+
+1. By changing the `FORK_DIGESTS` environment variable in your `.env` file and restarting the container
+2. By updating the environment variable while the container is running (it will detect the change automatically)
 
 ## Monitoring
 
@@ -121,6 +136,11 @@ The crawler creates log files in the `logs` directory, which is mounted as a vol
 ```bash
 docker-compose logs -f
 ```
+
+The logs directory also contains:
+- `crawler.log` - Main application logs
+- `health.log` - Current status for healthcheck
+- `partition_state.json` - Tracks which months have been processed
 
 ## Health Checks
 
@@ -139,7 +159,6 @@ The container includes a health check that verifies the crawler is running by ch
 ├── migrations/            # Database migration SQL files
 │   ├── 01_create_database.sql
 │   ├── 02_create_ipinfo_table.sql
-│   └── 03_create_ip_addresses_table.sql
 ├── README.md              # Project documentation
 ├── requirements.txt       # Python dependencies
 └── src/                   # Source code
@@ -147,7 +166,9 @@ The container includes a health check that verifies the crawler is running by ch
     ├── config.py          # Configuration management
     ├── crawler.py         # Main crawler logic
     ├── db.py              # Database interaction
-    └── migrations.py      # Database migration runner
+    ├── migrations.py      # Database migration runner
+    ├── partition_tracker.py # Manages incremental processing
+    └── utils.py           # Utility functions
 ```
 
 ### Running Locally for Development
@@ -170,3 +191,26 @@ For development without Docker:
    ```bash
    python -m src.crawler
    ```
+
+## Troubleshooting
+
+### Memory Limit Exceeded
+
+If you were previously encountering `MEMORY_LIMIT_EXCEEDED` errors when querying large tables, the incremental processing approach should solve this issue. The crawler now processes data month by month to keep memory usage low.
+
+### Checking Processing Status
+
+To check which months have been processed, examine the `partition_state.json` file in the logs directory. It contains information about:
+- The last fully processed month
+- The current month being processed
+- Whether the current month is complete
+- The list of fork digests being tracked
+
+### Resetting Processing
+
+If you need to start processing from scratch, simply stop the container and delete the `partition_state.json` file from the logs directory.
+
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
