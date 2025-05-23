@@ -13,6 +13,7 @@ A service that continuously fetches IP address information from ipinfo.io and st
 - Configurable fork digests for filtering IP addresses
 - Dockerized for easy deployment
 - Automatically sources IPs from your existing database tables
+- **One-time job mode** for batch processing without continuous operation
 
 ## Requirements
 
@@ -26,6 +27,7 @@ This application uses the `clickhouse-connect` library for ClickHouse communicat
 
 ## Quick Start
 
+### Continuous Mode (Default)
 1. Clone this repository
 2. Copy `.env.example` to `.env` and update with your credentials
 3. Run the service with Docker Compose
@@ -35,6 +37,63 @@ cp .env.example .env
 # Edit .env with your settings
 docker-compose up -d
 ```
+
+### One-Time Job Mode
+Run the crawler once to process a single batch of IPs and exit:
+
+```bash
+# Local execution
+python -m src.crawler --once
+
+# With custom batch size
+python -m src.crawler --once --batch-size 200
+
+# Docker execution
+docker-compose run --rm -e CRAWLER_MODE=once ip-crawler
+```
+
+## One-Time Job Mode
+
+The crawler can be run as a one-time job instead of a continuous service. This is useful for:
+- Processing batches on demand
+- Scheduled jobs (cron, Kubernetes CronJob)
+- Testing and development
+- Resource-constrained environments
+
+### Usage
+
+**Command Line:**
+```bash
+python -m src.crawler --once [--batch-size N]
+```
+
+**Docker:**
+```bash
+# Set environment variable
+export CRAWLER_MODE=once
+docker-compose up
+
+# Or inline
+docker-compose run --rm -e CRAWLER_MODE=once ip-crawler
+```
+
+**Output:**
+The one-time mode provides a summary of the batch processing results:
+```
+==================================================
+SINGLE RUN SUMMARY
+==================================================
+Total IPs processed: 150
+Successful: 147
+Failed: 3
+Success rate: 98.0%
+Total in database: 15,420
+Overall success rate: 96.8%
+==================================================
+```
+
+**Statistics File:**
+Results are saved to `logs/last_run_stats.json` for programmatic access.
 
 ## Environment Variables
 
@@ -63,6 +122,7 @@ All configuration is handled through environment variables in the `.env` file:
 - `MAX_RETRIES` - Maximum number of retries for failed requests (default: 3)
 - `RETRY_DELAY` - Seconds between retries (default: 5)
 - `FORK_DIGESTS` - Comma-separated list of fork digests to track (default: 0x56fdb5e0,0x824be431,0x21a6f836,0x3ebfd484,0x7d5aab40,0xf9ab5f85)
+- `CRAWLER_MODE` - Set to `once` for one-time job mode (Docker only)
 
 ## Database Schema
 
@@ -141,6 +201,7 @@ The logs directory also contains:
 - `crawler.log` - Main application logs
 - `health.log` - Current status for healthcheck
 - `partition_state.json` - Tracks which months have been processed
+- `last_run_stats.json` - Statistics from the last one-time job run
 
 ## Health Checks
 
@@ -187,9 +248,13 @@ For development without Docker:
    ```bash
    python -m src.migrations
    ```
-4. Start the crawler
+4. Start the crawler (continuous mode)
    ```bash
    python -m src.crawler
+   ```
+5. Or run once
+   ```bash
+   python -m src.crawler --once
    ```
 
 ## Troubleshooting
@@ -210,6 +275,12 @@ To check which months have been processed, examine the `partition_state.json` fi
 
 If you need to start processing from scratch, simply stop the container and delete the `partition_state.json` file from the logs directory.
 
+### No New IPs Found
+
+If the one-time job reports "No new IPs to process", it means:
+- All IPs in the current partition have already been processed
+- The current partition is complete and no new partitions are available
+- Check `partition_state.json` to see the current processing status
 
 ## License
 

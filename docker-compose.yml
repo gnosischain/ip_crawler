@@ -17,3 +17,12 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+  ip-crawler-once:
+    build: .
+    env_file:
+      - .env
+    environment:
+      - CRAWLER_MODE=once
+    volumes:
+      - ./logs:/app/logs
+    restart: "no" 

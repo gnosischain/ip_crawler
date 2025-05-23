@@ -7,6 +7,11 @@ echo "Starting IP Info Crawler..."
 echo "Running database migrations..."
 python -m src.migrations
 
-# Start the crawler
-echo "Starting crawler..."
-exec python -m src.crawler
+# Check if single-run mode is requested via environment variable
+if [ "$CRAWLER_MODE" = "once" ] || [ "$CRAWLER_MODE" = "single-run" ]; then
+    echo "Starting crawler in single-run mode..."
+    exec python -m src.crawler --once
+else
+    echo "Starting crawler in continuous mode..."
+    exec python -m src.crawler
+fi
