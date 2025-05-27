@@ -145,52 +145,64 @@ class IPInfoCrawler:
 
     def run_single_batch(self) -> Dict[str, Any]:
         """Run a single batch and return statistics."""
-        logger.info("Running single batch job")
+        logger.info("Running single batch job - will process current partition completely")
         
         # Update health check file
         with open(os.path.join(LOG_PATH, 'health.log'), 'w') as f:
             f.write(f"Single batch job running at {datetime.now().isoformat()}")
         
-        # Get batch of unprocessed IPs
-        ips = self.db.get_unprocessed_ips(BATCH_SIZE)
+        # Track overall statistics
+        total_successful = 0
+        total_failed = 0
+        total_ips_processed = 0
+        batches_processed = 0
         
-        if not ips:
-            logger.info("No new IPs to process")
-            return {
-                "total_ips": 0,
-                "successful": 0,
-                "failed": 0,
-                "success_rate": 0.0,
-                "message": "No new IPs found to process"
-            }
-        
-        logger.info(f"Processing {len(ips)} IPs in single batch")
-        
-        # Process each IP
-        successful = 0
-        failed = 0
-        
-        for i, ip in enumerate(ips, 1):
-            if not self.running:
-                logger.info("Shutdown requested, stopping processing")
-                break
+        # Process until the current partition is exhausted
+        while self.running:
+            # Get batch of unprocessed IPs
+            ips = self.db.get_unprocessed_ips(BATCH_SIZE)
             
-            logger.info(f"Processing IP {i}/{len(ips)}: {ip}")
+            if not ips:
+                # Check if partition was exhausted or if we're truly done
+                if self.db.get_partition_exhausted():
+                    logger.info("Current partition exhausted, single-run complete")
+                    break
+                else:
+                    logger.info("No IPs in current batch, but partition not exhausted yet")
+                    continue
             
-            if self.process_ip(ip):
-                successful += 1
-            else:
-                failed += 1
+            batches_processed += 1
+            logger.info(f"Processing batch #{batches_processed} with {len(ips)} IPs")
+            
+            # Process each IP in the batch
+            for i, ip in enumerate(ips, 1):
+                if not self.running:
+                    logger.info("Shutdown requested, stopping processing")
+                    break
+                
+                logger.info(f"Processing IP {i}/{len(ips)}: {ip}")
+                total_ips_processed += 1
+                
+                if self.process_ip(ip):
+                    total_successful += 1
+                else:
+                    total_failed += 1
+            
+            logger.info(f"Batch #{batches_processed} completed: {len(ips)} IPs processed")
         
         # Get final statistics
         stats = {
-            "total_ips": len(ips),
-            "successful": successful,
-            "failed": failed,
-            "success_rate": round((successful / len(ips) * 100) if len(ips) > 0 else 0, 2)
+            "total_ips": total_ips_processed,
+            "successful": total_successful,
+            "failed": total_failed,
+            "batches_processed": batches_processed,
+            "success_rate": round((total_successful / total_ips_processed * 100) if total_ips_processed > 0 else 0, 2)
         }
         
-        logger.info(f"Single batch completed: {json.dumps(stats)}")
+        if total_ips_processed == 0:
+            stats["message"] = "No new IPs found to process"
+        
+        logger.info(f"Single batch job completed: {json.dumps(stats)}")
         
         # Get database statistics
         try:
@@ -317,6 +329,7 @@ def main():
             print(f"Total IPs processed: {result['total_ips']}")
             print(f"Successful: {result['successful']}")
             print(f"Failed: {result['failed']}")
+            print(f"Batches processed: {result['batches_processed']}")
             print(f"Success rate: {result['success_rate']}%")
             
             if 'database_stats' in result:

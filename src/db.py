@@ -1,6 +1,6 @@
 import os
 import logging
-from typing import Dict, List, Optional, Tuple, Any, Union
+from typing import Dict, List, Optional, Tuple, Any, Union, Set
 import time
 import clickhouse_connect
 from clickhouse_connect.driver.client import Client
@@ -25,6 +25,10 @@ class Database:
         # Initialize the partition tracker
         self.tracker = PartitionTracker(os.path.join(LOG_PATH, "partition_state.json"))
         logger.info("Initialized partition tracker")
+        
+        # Keep track of IPs we've seen in current partition to avoid re-querying
+        self.seen_ips_in_partition: Set[str] = set()
+        self.current_partition_id = None
 
     def _create_client(self) -> Client:
         """Create and return a ClickHouse client."""
@@ -87,36 +91,80 @@ class Database:
     def get_unprocessed_ips(self, limit: int) -> List[str]:
         """Get IPs that haven't been processed yet using partition-based approach."""
         try:
-            # Get the query for the next partition to process
+            # Check if we're starting a new partition
+            current_month = self.tracker.state.get("current_month")
+            if current_month != self.current_partition_id:
+                logger.info(f"Starting new partition: {current_month}")
+                self.seen_ips_in_partition.clear()
+                self.current_partition_id = current_month
+            
+            # Get the query for the current partition
             query_template = self.tracker.get_next_partition_query()
             
             if not query_template:
                 logger.info("No more partitions to process at this time")
                 return []
             
-            # Format the query with the batch size
-            query = query_template.format(batch_size=limit)
+            # Build exclusion list for IPs we've already queried in this partition
+            if self.seen_ips_in_partition:
+                # For safety, limit the exclusion list size
+                if len(self.seen_ips_in_partition) > 10000:
+                    logger.warning("Too many IPs in exclusion list, marking partition complete")
+                    self.tracker.mark_current_complete()
+                    self.seen_ips_in_partition.clear()
+                    self.current_partition_id = None
+                    return self.get_unprocessed_ips(limit)
+                
+                # Add exclusion filter
+                excluded_ips = "', '".join(self.seen_ips_in_partition)
+                exclusion_filter = f" AND ip NOT IN ('{excluded_ips}')"
+                query = query_template.replace(
+                    "WHERE ip != ''",
+                    f"WHERE ip != ''{exclusion_filter}"
+                ).format(batch_size=limit)
+            else:
+                # No exclusions needed for first query
+                query = query_template.format(batch_size=limit)
             
-            # Execute the query directly without creating a temporary table
+            # Execute the query
             result = self.execute(query)
             ips = [row[0] for row in result]
             
-            # If we got fewer results than the limit, this partition is complete
-            if len(ips) < limit:
-                logger.info(f"Partition completed with {len(ips)} IPs")
+            if not ips:
+                logger.info("No more IPs in current partition, marking complete")
                 self.tracker.mark_current_complete()
+                self.seen_ips_in_partition.clear()
+                self.current_partition_id = None
+                # Try the next partition
+                return self.get_unprocessed_ips(limit)
             
-            # Filter out IPs we've already processed
+            logger.info(f"Retrieved {len(ips)} IPs from partition")
+            
+            # Add these IPs to our seen set
+            self.seen_ips_in_partition.update(ips)
+            
+            # Filter out IPs we've already processed in the database
             unprocessed_ips = []
             for ip in ips:
                 if not self.check_ip_exists(ip):
                     unprocessed_ips.append(ip)
             
             logger.info(f"Found {len(unprocessed_ips)} unprocessed IPs out of {len(ips)} total")
+            
+            # If all IPs were already processed, continue to next batch
+            if len(unprocessed_ips) == 0 and len(ips) > 0:
+                logger.info("All IPs in this batch were already processed, fetching next batch...")
+                return self.get_unprocessed_ips(limit)
+            
             return unprocessed_ips
             
         except Exception as e:
             logger.error(f"Error getting unprocessed IPs: {e}")
+            # If there's an error with the exclusion list, clear it and try again
+            if "too long" in str(e).lower() or "memory" in str(e).lower():
+                logger.warning("Query too complex, clearing seen IPs and retrying")
+                self.seen_ips_in_partition.clear()
+                return self.get_unprocessed_ips(limit)
             return []
 
     def save_ip_info(self, ip_info: Dict[str, Any], success: bool = True, error: str = '') -> None:
@@ -192,9 +240,6 @@ class Database:
         """
         failed_lookups = self.execute(failed_query)[0][0]
         
-        return {
-            "total_processed": total_processed,
-            "successful_lookups": successful_lookups,
-            "failed_lookups": failed_lookups,
-            "success_rate": round((successful_lookups / total_processed * 100) if total_processed > 0 else 0, 2)
-        }
+    def get_partition_exhausted(self) -> bool:
+        """Check if the current partition has been exhausted."""
+        return self.current_partition_id is None or len(self.seen_ips_in_partition) == 0

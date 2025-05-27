@@ -46,6 +46,10 @@ class PartitionTracker:
                     # Update fork_digests from the state file if available
                     if "fork_digests" in state:
                         self.fork_digests = state["fork_digests"]
+                    # Migrate from old offset-based state if needed
+                    if "current_offset" in state and "last_processed_ip" not in state:
+                        state["last_processed_ip"] = None
+                        state.pop("current_offset", None)
                     return state
             except Exception as e:
                 logger.error(f"Error loading state file: {e}")
@@ -61,6 +65,7 @@ class PartitionTracker:
         return {
             "last_processed_month": start_date.strftime("%Y-%m-01"),
             "current_month": None,
+            "last_processed_ip": None,
             "is_complete": False,
             "fork_digests": self.fork_digests
         }
@@ -89,16 +94,15 @@ class PartitionTracker:
             fork_digests_sql = ", ".join(f"'{digest}'" for digest in self.fork_digests)
             
             return f"""
-            SELECT DISTINCT toString(ip) AS ip
-            FROM (
-                SELECT JSONExtractString(toString(peer_properties), 'ip') AS ip
-                FROM nebula.visits
-                WHERE toStartOfMonth(visit_started_at) = toDate('{month_start}')
+            SELECT DISTINCT
+                peer_properties.ip.:String AS ip
+            FROM nebula.visits
+            PREWHERE
+                toStartOfMonth(visit_started_at) = toDate('{month_start}')
                 AND (
-                    JSONExtractString(toString(peer_properties), 'fork_digest') IN ({fork_digests_sql})
-                    OR JSONExtractString(toString(peer_properties), 'next_fork_version') LIKE '%064%'
+                    peer_properties.fork_digest IN ({fork_digests_sql})
+                    OR peer_properties.next_fork_version.:String LIKE '%064%'
                 )
-            )
             WHERE ip != ''
             LIMIT {{batch_size}}
             """
@@ -115,6 +119,7 @@ class PartitionTracker:
         
         # Set current month being processed
         self.state["current_month"] = next_month.strftime("%Y-%m-01")
+        self.state["last_processed_ip"] = None  # Reset for new partition
         self.state["is_complete"] = False
         self.save_state()
         
@@ -122,18 +127,17 @@ class PartitionTracker:
         fork_digests_sql = ", ".join(f"'{digest}'" for digest in self.fork_digests)
         
         return f"""
-        SELECT DISTINCT toString(ip) AS ip
-        FROM (
-            SELECT JSONExtractString(toString(peer_properties), 'ip') AS ip
+         SELECT DISTINCT
+                peer_properties.ip.:String AS ip
             FROM nebula.visits
-            WHERE toStartOfMonth(visit_started_at) = toDate('{self.state["current_month"]}')
-            AND (
-                JSONExtractString(toString(peer_properties), 'fork_digest') IN ({fork_digests_sql})
-                OR JSONExtractString(toString(peer_properties), 'next_fork_version') LIKE '%064%'
-            )
-        )
-        WHERE ip != ''
-        LIMIT {{batch_size}}
+            PREWHERE
+                toStartOfMonth(visit_started_at) = toDate('{self.state["current_month"]}')
+                AND (
+                    peer_properties.fork_digest IN ({fork_digests_sql})
+                    OR peer_properties.next_fork_version.:String LIKE '%064%'
+                )
+            WHERE ip != ''
+            LIMIT {{batch_size}}
         """
     
     def mark_current_complete(self) -> None:
@@ -141,8 +145,20 @@ class PartitionTracker:
         if self.state["current_month"]:
             self.state["last_processed_month"] = self.state["current_month"]
             self.state["current_month"] = None
+            self.state["last_processed_ip"] = None  # Reset last IP
             self.state["is_complete"] = True
             self.save_state()
+    
+    def update_last_processed_ip(self, ip: str) -> None:
+        """
+        Update the last processed IP for the current partition.
+        
+        Args:
+            ip: The last IP that was processed
+        """
+        self.state["last_processed_ip"] = ip
+        self.save_state()
+        logger.debug(f"Updated last processed IP to: {ip}")
     
     def update_fork_digests(self, new_digests: List[str]) -> None:
         """
