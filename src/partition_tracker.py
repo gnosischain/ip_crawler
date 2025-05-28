@@ -19,14 +19,16 @@ class PartitionTracker:
     Tracks which time partitions have been processed to avoid memory issues
     with large tables by processing them incrementally.
     """
-    def __init__(self, state_file_path: str = "partition_state.json"):
+    def __init__(self, state_file_path: str = "partition_state.json", single_run_mode: bool = False):
         """
         Initialize the partition tracker.
         
         Args:
             state_file_path: Path to the state file that persists tracking info
+            single_run_mode: If True, disable reprocessing logic for one-time jobs
         """
         self.state_file_path = state_file_path
+        self.single_run_mode = single_run_mode  # NEW: Track if we're in single-run mode
         
         # Define default fork digests that we're interested in
         self.fork_digests = [
@@ -107,14 +109,81 @@ class PartitionTracker:
             LIMIT {{batch_size}}
             """
         
+        # CRITICAL FIX: In single-run mode, don't do any reprocessing logic
+        if self.single_run_mode:
+            logger.info("Single-run mode: Finding next unprocessed partition")
+            
+            # Find the next month to process
+            last_processed = datetime.strptime(self.state["last_processed_month"], "%Y-%m-01")
+            next_month = (last_processed + timedelta(days=32)).replace(day=1)
+            
+            # Don't process future months
+            current_month_start = datetime.now().replace(day=1)
+            if next_month > current_month_start:
+                logger.info("Single-run mode: All months up to current month have been processed")
+                return None
+            
+            # Set current month being processed
+            self.state["current_month"] = next_month.strftime("%Y-%m-01")
+            self.state["last_processed_ip"] = None
+            self.state["is_complete"] = False
+            self.save_state()
+            
+            logger.info(f"Single-run mode: Processing month {self.state['current_month']}")
+            
+            # Format as list for SQL IN clause
+            fork_digests_sql = ", ".join(f"'{digest}'" for digest in self.fork_digests)
+            
+            return f"""
+            SELECT DISTINCT
+                peer_properties.ip.:String AS ip
+            FROM nebula.visits
+            PREWHERE
+                toStartOfMonth(visit_started_at) = toDate('{self.state["current_month"]}')
+                AND (
+                    peer_properties.fork_digest IN ({fork_digests_sql})
+                    OR peer_properties.next_fork_version.:String LIKE '%064%'
+                )
+            WHERE ip != ''
+            LIMIT {{batch_size}}
+            """
+        
+        # CONTINUOUS MODE LOGIC (original logic with reprocessing)
         # Find the next month to process
         last_processed = datetime.strptime(self.state["last_processed_month"], "%Y-%m-01")
         next_month = (last_processed + timedelta(days=32)).replace(day=1)
         
-        # Don't process future months
-        current_month_start = datetime.now().replace(day=1)
+        # Get current and previous month for edge case handling
+        now = datetime.now()
+        current_month_start = now.replace(day=1)
+        previous_month_start = (current_month_start - timedelta(days=1)).replace(day=1)
+        
+        # Handle month-end edge case - but with limits
+        if now.day <= 3:  # First 3 days of the month
+            logger.info(f"Early in month (day {now.day}), checking if previous month needs reprocessing")
+            
+            prev_month_str = previous_month_start.strftime("%Y-%m-01")
+            if self.state["last_processed_month"] == prev_month_str:
+                logger.info(f"Reprocessing previous month {prev_month_str} for late-arriving data")
+                next_month = previous_month_start
+        
+        # Don't process future months, but handle current month logic
         if next_month > current_month_start:
-            logger.info("All months up to current month have been processed")
+            # Check if we should process current month
+            current_month_str = current_month_start.strftime("%Y-%m-01")
+            
+            if self.state["last_processed_month"] != current_month_str:
+                # Current month hasn't been processed yet
+                logger.info(f"Starting to process current month: {current_month_str}")
+                next_month = current_month_start
+            else:
+                # Allow reprocessing current month for new data
+                logger.info(f"Reprocessing current month {current_month_str} for new data")
+                next_month = current_month_start
+        
+        # Special case: if we're trying to process a future month, stop
+        if next_month > current_month_start:
+            logger.info("All available months have been processed")
             return None
         
         # Set current month being processed
@@ -127,23 +196,38 @@ class PartitionTracker:
         fork_digests_sql = ", ".join(f"'{digest}'" for digest in self.fork_digests)
         
         return f"""
-         SELECT DISTINCT
-                peer_properties.ip.:String AS ip
-            FROM nebula.visits
-            PREWHERE
-                toStartOfMonth(visit_started_at) = toDate('{self.state["current_month"]}')
-                AND (
-                    peer_properties.fork_digest IN ({fork_digests_sql})
-                    OR peer_properties.next_fork_version.:String LIKE '%064%'
-                )
-            WHERE ip != ''
-            LIMIT {{batch_size}}
+        SELECT DISTINCT
+            peer_properties.ip.:String AS ip
+        FROM nebula.visits
+        PREWHERE
+            toStartOfMonth(visit_started_at) = toDate('{self.state["current_month"]}')
+            AND (
+                peer_properties.fork_digest IN ({fork_digests_sql})
+                OR peer_properties.next_fork_version.:String LIKE '%064%'
+            )
+        WHERE ip != ''
+        LIMIT {{batch_size}}
         """
     
     def mark_current_complete(self) -> None:
         """Mark the current partition as completely processed."""
         if self.state["current_month"]:
-            self.state["last_processed_month"] = self.state["current_month"]
+            # In single-run mode, always mark as fully complete
+            if self.single_run_mode:
+                self.state["last_processed_month"] = self.state["current_month"]
+                logger.info(f"Single-run mode: Marked month {self.state['current_month']} as fully complete")
+            else:
+                # Continuous mode logic with delayed completion
+                now = datetime.now()
+                current_processing_month = datetime.strptime(self.state["current_month"], "%Y-%m-01")
+                current_month_start = now.replace(day=1)
+                
+                if current_processing_month < current_month_start or now.day > 3:
+                    self.state["last_processed_month"] = self.state["current_month"]
+                    logger.info(f"Marked month {self.state['current_month']} as fully complete")
+                else:
+                    logger.info(f"Month {self.state['current_month']} exhausted but keeping open for reprocessing")
+            
             self.state["current_month"] = None
             self.state["last_processed_ip"] = None  # Reset last IP
             self.state["is_complete"] = True

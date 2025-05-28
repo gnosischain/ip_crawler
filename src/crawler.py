@@ -45,7 +45,8 @@ DEFAULT_FORK_DIGESTS = [
 
 class IPInfoCrawler:
     def __init__(self, single_run_mode=False):
-        self.db = Database()
+        # Pass single_run_mode to the database
+        self.db = Database(single_run_mode=single_run_mode)
         self.running = True
         self.single_run_mode = single_run_mode
         self.setup_signal_handlers()

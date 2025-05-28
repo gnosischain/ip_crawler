@@ -18,13 +18,16 @@ from src.partition_tracker import PartitionTracker
 logger = logging.getLogger('db')
 
 class Database:
-    def __init__(self):
+    def __init__(self, single_run_mode: bool = False):
         self.client = self._create_client()
         logger.info(f"Connected to ClickHouse at {CLICKHOUSE_HOST}:{CLICKHOUSE_PORT}")
         
-        # Initialize the partition tracker
-        self.tracker = PartitionTracker(os.path.join(LOG_PATH, "partition_state.json"))
-        logger.info("Initialized partition tracker")
+        # Initialize the partition tracker with single-run mode flag
+        self.tracker = PartitionTracker(
+            os.path.join(LOG_PATH, "partition_state.json"), 
+            single_run_mode=single_run_mode
+        )
+        logger.info(f"Initialized partition tracker (single_run_mode={single_run_mode})")
         
         # Keep track of IPs we've seen in current partition to avoid re-querying
         self.seen_ips_in_partition: Set[str] = set()
@@ -104,7 +107,7 @@ class Database:
             if not query_template:
                 logger.info("No more partitions to process at this time")
                 return []
-            
+
             # Build exclusion list for IPs we've already queried in this partition
             if self.seen_ips_in_partition:
                 # For safety, limit the exclusion list size
@@ -113,7 +116,13 @@ class Database:
                     self.tracker.mark_current_complete()
                     self.seen_ips_in_partition.clear()
                     self.current_partition_id = None
-                    return self.get_unprocessed_ips(limit)
+                    
+                    # In single-run mode, don't retry
+                    if self.tracker.single_run_mode:
+                        logger.info("Single-run mode: Partition exhausted, stopping")
+                        return []
+                    else:
+                        return self.get_unprocessed_ips(limit)
                 
                 # Add exclusion filter
                 excluded_ips = "', '".join(self.seen_ips_in_partition)
@@ -135,8 +144,14 @@ class Database:
                 self.tracker.mark_current_complete()
                 self.seen_ips_in_partition.clear()
                 self.current_partition_id = None
-                # Try the next partition
-                return self.get_unprocessed_ips(limit)
+                
+                # CRITICAL FIX: In single-run mode, don't retry - just return empty
+                if self.tracker.single_run_mode:
+                    logger.info("Single-run mode: No more IPs found, stopping")
+                    return []
+                else:
+                    # Try the next partition in continuous mode
+                    return self.get_unprocessed_ips(limit)
             
             logger.info(f"Retrieved {len(ips)} IPs from partition")
             
@@ -151,10 +166,14 @@ class Database:
             
             logger.info(f"Found {len(unprocessed_ips)} unprocessed IPs out of {len(ips)} total")
             
-            # If all IPs were already processed, continue to next batch
+            # If all IPs were already processed
             if len(unprocessed_ips) == 0 and len(ips) > 0:
-                logger.info("All IPs in this batch were already processed, fetching next batch...")
-                return self.get_unprocessed_ips(limit)
+                if self.tracker.single_run_mode:
+                    logger.info("Single-run mode: All IPs in this batch were already processed, continuing to next batch...")
+                    return self.get_unprocessed_ips(limit)
+                else:
+                    logger.info("All IPs in this batch were already processed, fetching next batch...")
+                    return self.get_unprocessed_ips(limit)
             
             return unprocessed_ips
             
@@ -164,7 +183,12 @@ class Database:
             if "too long" in str(e).lower() or "memory" in str(e).lower():
                 logger.warning("Query too complex, clearing seen IPs and retrying")
                 self.seen_ips_in_partition.clear()
-                return self.get_unprocessed_ips(limit)
+                
+                # In single-run mode, don't retry on errors
+                if self.tracker.single_run_mode:
+                    logger.info("Single-run mode: Error occurred, stopping")
+                    return []
+                    
             return []
 
     def save_ip_info(self, ip_info: Dict[str, Any], success: bool = True, error: str = '') -> None:
@@ -240,6 +264,29 @@ class Database:
         """
         failed_lookups = self.execute(failed_query)[0][0]
         
+        # Calculate success rate
+        success_rate = (successful_lookups / total_processed * 100) if total_processed > 0 else 0
+        
+        # Return the statistics dictionary
+        return {
+            "total_processed": total_processed,
+            "successful_lookups": successful_lookups,
+            "failed_lookups": failed_lookups,
+            "success_rate": round(success_rate, 2)
+        }
+
     def get_partition_exhausted(self) -> bool:
         """Check if the current partition has been exhausted."""
-        return self.current_partition_id is None or len(self.seen_ips_in_partition) == 0
+        # If there's no current partition being processed, it's exhausted
+        if not self.current_partition_id:
+            return True
+        
+        # If current month is not set in tracker state, it's exhausted  
+        if not self.tracker.state.get("current_month"):
+            return True
+            
+        # If we have a large number of seen IPs, consider it exhausted to avoid memory issues
+        if len(self.seen_ips_in_partition) > 10000:
+            return True
+            
+        return False
