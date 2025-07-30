@@ -97,13 +97,13 @@ class PartitionTracker:
             
             return f"""
             SELECT DISTINCT
-                peer_properties.ip.:String AS ip
+                JSONExtractString(toString(peer_properties), 'ip') AS ip
             FROM nebula.visits
             PREWHERE
                 toStartOfMonth(visit_started_at) = toDate('{month_start}')
                 AND (
-                    peer_properties.fork_digest IN ({fork_digests_sql})
-                    OR peer_properties.next_fork_version.:String LIKE '%064%'
+                    JSONExtractString(toString(peer_properties), 'fork_digest') IN ({fork_digests_sql})
+                    OR JSONExtractString(toString(peer_properties), 'next_fork_version') LIKE '%064%'
                 )
             WHERE ip != ''
             LIMIT {{batch_size}}
@@ -136,13 +136,13 @@ class PartitionTracker:
             
             return f"""
             SELECT DISTINCT
-                peer_properties.ip.:String AS ip
+                JSONExtractString(toString(peer_properties), 'ip') AS ip
             FROM nebula.visits
             PREWHERE
                 toStartOfMonth(visit_started_at) = toDate('{self.state["current_month"]}')
                 AND (
-                    peer_properties.fork_digest IN ({fork_digests_sql})
-                    OR peer_properties.next_fork_version.:String LIKE '%064%'
+                    JSONExtractString(toString(peer_properties), 'fork_digest') IN ({fork_digests_sql})
+                    OR JSONExtractString(toString(peer_properties), 'next_fork_version') LIKE '%064%'
                 )
             WHERE ip != ''
             LIMIT {{batch_size}}
@@ -197,13 +197,13 @@ class PartitionTracker:
         
         return f"""
         SELECT DISTINCT
-            peer_properties.ip.:String AS ip
+            JSONExtractString(toString(peer_properties), 'ip') AS ip
         FROM nebula.visits
         PREWHERE
             toStartOfMonth(visit_started_at) = toDate('{self.state["current_month"]}')
             AND (
-                peer_properties.fork_digest IN ({fork_digests_sql})
-                OR peer_properties.next_fork_version.:String LIKE '%064%'
+                JSONExtractString(toString(peer_properties), 'fork_digest') IN ({fork_digests_sql})
+                OR JSONExtractString(toString(peer_properties), 'next_fork_version') LIKE '%064%'
             )
         WHERE ip != ''
         LIMIT {{batch_size}}
