@@ -53,7 +53,16 @@ def run_migrations() -> None:
         try:
             with open(file_path, 'r') as f:
                 sql = f.read()
-            
+
+            # Migration SQL is written against a {{DATABASE}} placeholder so the
+            # target database follows CLICKHOUSE_DATABASE. Without this the files
+            # hardcoded `crawlers_data`, so pointing the crawler at a dev database
+            # created the tables in prod anyway (or, if the run lacked prod write
+            # grants, failed on a table that was never created where it was being
+            # read). Production is unaffected: CLICKHOUSE_DATABASE defaults to
+            # crawlers_data, so the rendered SQL is byte-identical to before.
+            sql = sql.replace('{{DATABASE}}', CLICKHOUSE_DATABASE)
+
             # Run the migration queries
             execute_migration(client, sql, file_name)
             

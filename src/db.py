@@ -240,6 +240,53 @@ class Database:
         result = self.execute(query)
         return len(result) > 0
         
+    def get_ips_from_query(self, query: str) -> List[str]:
+        """Return de-duplicated IPs from an arbitrary SELECT, minus ones already stored.
+
+        This is the explicit-source counterpart to get_unprocessed_ips(). It does
+        NOT touch PartitionTracker: datasets other than the nebula P2P census have
+        no month partitioning and no fork digests, so the partition walk does not
+        apply to them. Everything downstream (fetch, sanitize, insert) is shared.
+
+        Pre-filtering against the ipinfo table matters for cost, not just speed:
+        process_ip() would skip existing IPs anyway, but only after they had been
+        counted as work. Filtering here means the reported total is the number of
+        API calls actually needed.
+
+        Guard: only a single read-only SELECT is accepted. These queries can come
+        from an env var, and this method interpolates nothing -- but the query
+        itself is executed as given, so anything that is not a bare SELECT is
+        refused rather than trusted.
+        """
+        cleaned = query.strip().rstrip(';').strip()
+        lowered = cleaned.lower()
+        if not lowered.startswith(('select', 'with')):
+            raise ValueError(f"IP source query must be a SELECT/WITH, got: {cleaned[:60]!r}")
+        for banned in ('insert ', 'alter ', 'drop ', 'create ', 'truncate ',
+                       'attach ', 'detach ', 'system ', 'optimize ', 'delete '):
+            if banned in lowered:
+                raise ValueError(f"IP source query contains a non-read statement: {banned.strip()!r}")
+        if ';' in cleaned:
+            raise ValueError("IP source query must be a single statement (no ';')")
+
+        rows = self.execute(cleaned)
+        candidates = []
+        seen = set()
+        for row in rows:
+            if not row:
+                continue
+            ip = str(row[0]).strip()
+            if ip and ip not in seen:
+                seen.add(ip)
+                candidates.append(ip)
+
+        fresh = [ip for ip in candidates if not self.check_ip_exists(ip)]
+        logger.info(
+            f"IP source query returned {len(candidates)} distinct IP(s); "
+            f"{len(candidates) - len(fresh)} already stored, {len(fresh)} to fetch"
+        )
+        return fresh
+
     def update_fork_digests(self, new_digests: List[str]) -> None:
         """Update the fork digests in the tracker."""
         self.tracker.update_fork_digests(new_digests)

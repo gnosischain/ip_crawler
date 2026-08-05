@@ -15,6 +15,34 @@ CLICKHOUSE_SECURE = os.environ.get('CLICKHOUSE_SECURE', 'false').lower() == 'tru
 # Table Configuration
 IP_INFO_TABLE = os.environ.get('IP_INFO_TABLE', 'ipinfo')
 
+# ---------------------------------------------------------------------------
+# Explicit IP sources (`--source` / `--ips-query`)
+#
+# The default crawl walks nebula.visits month by month via PartitionTracker and
+# filters on beacon-chain fork digests. That machinery is specific to the P2P
+# census: other datasets have their own IP lists and no month partitioning, so
+# they cannot reuse it.
+#
+# These presets feed the SAME enrichment path (Crawler.process_ip) from an
+# arbitrary SELECT instead. The nebula path is untouched.
+#
+# A preset must return exactly ONE column of IPv4 strings. Rows already present
+# in the ipinfo table are skipped before any API call is made.
+# ---------------------------------------------------------------------------
+HOPR_NODES_TABLE = os.environ.get('HOPR_NODES_TABLE', 'dbt.int_hopr_nodes')
+
+IP_SOURCE_QUERIES = {
+    # HOPR mixnet / GnosisVPN nodes. `announced_ip` is the IPv4 a node published
+    # on-chain via HoprAnnouncements.AddressAnnouncement, extracted in dbt.
+    # Enriching these turns int_hopr_nodes.geo_source from 'unenriched' to
+    # 'ipinfo' with no dbt model change -- that model already LEFT JOINs ipinfo.
+    'hopr': f"""
+        SELECT DISTINCT announced_ip AS ip
+        FROM {HOPR_NODES_TABLE}
+        WHERE announced_ip IS NOT NULL AND announced_ip != ''
+    """,
+}
+
 # IPInfo API Configuration
 IPINFO_API_TOKEN = os.environ.get('IPINFO_API_TOKEN', '')
 IPINFO_RATE_LIMIT = int(os.environ.get('IPINFO_RATE_LIMIT', 50000))  # Requests per day

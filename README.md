@@ -174,6 +174,45 @@ WHERE ip != ''
 LIMIT {batch_size}
 ```
 
+### Explicit IP sources (`--source` / `--ips-query`)
+
+The crawl above is specific to the P2P census: it walks `nebula.visits` month by
+month via `PartitionTracker` and filters on beacon-chain fork digests. Other
+datasets have their own IP list, no month partitioning and no fork digests, so
+none of that applies to them.
+
+For those, pass an explicit source. Discovery is the only thing that differs —
+fetch, sanitize and insert all go through the same `process_ip()`, and the nebula
+path is untouched, so running a source cannot disturb an in-flight crawl.
+
+```bash
+# Named preset (see IP_SOURCE_QUERIES in src/config.py)
+python -m src.crawler --source hopr
+
+# Ad-hoc: any read-only SELECT returning a single IP column
+python -m src.crawler --ips-query "SELECT DISTINCT ip FROM some.table WHERE ip != ''"
+```
+
+Both run once and exit. Before any API call the crawler de-duplicates the list
+and drops IPs already present in `ipinfo`, so the reported total is the number of
+requests actually needed.
+
+Queries are validated as a single read-only statement: anything that is not a
+bare `SELECT`/`WITH`, contains a second statement, or contains a write keyword is
+refused. Presets can come from environment configuration, so they are checked
+rather than trusted.
+
+**Available presets**
+
+| Preset | IPs | Source table |
+|---|---|---|
+| `hopr` | IPv4 addresses HOPR mixnet nodes announced on-chain | `HOPR_NODES_TABLE` (default `dbt.int_hopr_nodes`) |
+
+The `hopr` preset needs `int_hopr_nodes` to exist in the target database — it is
+built by dbt-cerebro. Enriching those IPs flips that model's `geo_source` from
+`unenriched` to `ipinfo` with no dbt change, because it already LEFT JOINs
+`ipinfo`.
+
 ## Incremental Processing
 
 To handle very large tables without encountering memory limitations, the crawler:
