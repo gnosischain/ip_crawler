@@ -406,7 +406,31 @@ def main():
             if 'error' in result:
                 print(f"ERROR: {result['error']}")
             print("="*50)
-            sys.exit(1 if result.get('error') else 0)
+
+            # Exit code contract, written for a scheduled job rather than a human:
+            #
+            #   error                     -> 1  (could not even resolve the IP list)
+            #   tried some, none worked   -> 1  (bad token, rate limit, ipinfo down)
+            #   partial failures          -> 0  (see below)
+            #   nothing to do             -> 0  (everything already enriched)
+            #
+            # Total failure has to be non-zero or a broken run looks green forever: the
+            # job "succeeds" every night while enriching nothing, and the only symptom
+            # is geo that quietly stops improving.
+            #
+            # Partial failure stays SUCCESS on purpose. A handful of IPs failing is
+            # normal transient API behaviour, and it is self-healing -- those IPs are
+            # still missing from ipinfo, so the next run simply retries them. Failing
+            # the job would raise an alert for something that fixes itself.
+            attempted = result.get('total_ips', 0)
+            succeeded = result.get('successful', 0)
+            total_failure = attempted > 0 and succeeded == 0
+            if total_failure:
+                logger.error(
+                    f"IP source {result['source']!r}: all {attempted} enrichment(s) "
+                    "failed - treating as job failure"
+                )
+            sys.exit(1 if (result.get('error') or total_failure) else 0)
 
         crawler = IPInfoCrawler(single_run_mode=args.once)
         result = crawler.run_crawler()

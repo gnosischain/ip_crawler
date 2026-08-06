@@ -197,6 +197,25 @@ Both run once and exit. Before any API call the crawler de-duplicates the list
 and drops IPs already present in `ipinfo`, so the reported total is the number of
 requests actually needed.
 
+**In a container, set `IP_SOURCE` — not `CRAWLER_MODE`:**
+
+```bash
+docker-compose run --rm ip-crawler-source              # defaults to IP_SOURCE=hopr
+docker-compose run --rm -e IP_SOURCE=hopr ip-crawler
+```
+
+`CRAWLER_MODE=once` means "one batch of the **nebula** crawl". It reads like the
+right setting for a scheduled source job and is not — it would enrich no HOPR IPs,
+consume nebula crawl budget, and not error. The two are separate variables so that
+mistake cannot happen quietly. `IP_SOURCE` is checked first in `entrypoint.sh` and
+is unset in the nebula deployment, which therefore behaves exactly as before.
+
+**Exit codes** (written for a scheduled job): `1` if the IP list could not be
+resolved, or if it attempted some IPs and *every one* failed — a broken token or a
+dead API must not look green. `0` on partial failure, which is normal transient API
+behaviour and self-heals, since the un-enriched IPs are simply retried next run.
+`0` when there was nothing to do.
+
 Queries are validated as a single read-only statement: anything that is not a
 bare `SELECT`/`WITH`, contains a second statement, or contains a write keyword is
 refused. Presets can come from environment configuration, so they are checked
