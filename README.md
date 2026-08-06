@@ -232,6 +232,19 @@ built by dbt-cerebro. Enriching those IPs flips that model's `geo_source` from
 `unenriched` to `ipinfo` with no dbt change, because it already LEFT JOINs
 `ipinfo`.
 
+**Deployment prerequisite — the likely first-run failure.** This preset reads
+`dbt.int_hopr_nodes` and writes `crawlers_data.ipinfo`, so the crawler's ClickHouse
+user needs **SELECT on the `dbt` database**. The nebula crawl never touches `dbt`, so
+an existing deployment almost certainly does not have that grant, and the symptom is a
+plain `ACCESS_DENIED` on the source query rather than anything HOPR-shaped. The run
+exits non-zero in that case, so a scheduled job will surface it — but only if someone
+is watching the exit code.
+
+Ordering: the preset reads a dbt model and writes a table dbt reads back, so it wants
+to run **after** dbt. It does not need strict sequencing though — if dbt runs daily
+anyway, the next run picks up whatever geography this wrote, and the worst case is a
+new node's country landing a day late.
+
 ## Incremental Processing
 
 To handle very large tables without encountering memory limitations, the crawler:
