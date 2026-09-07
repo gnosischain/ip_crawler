@@ -11,7 +11,7 @@ from clickhouse_connect.driver.exceptions import ClickHouseError
 from src.config import (
     CLICKHOUSE_HOST, CLICKHOUSE_PORT, CLICKHOUSE_USER, 
     CLICKHOUSE_PASSWORD, CLICKHOUSE_DATABASE, CLICKHOUSE_SECURE,
-    MIGRATIONS_PATH
+    IP_INFO_TABLE, MIGRATIONS_PATH
 )
 
 # Set up logger
@@ -62,6 +62,8 @@ def run_migrations() -> None:
             # read). Production is unaffected: CLICKHOUSE_DATABASE defaults to
             # crawlers_data, so the rendered SQL is byte-identical to before.
             sql = sql.replace('{{DATABASE}}', CLICKHOUSE_DATABASE)
+            # Same for the table, which the crawler reads from IP_INFO_TABLE.
+            sql = sql.replace('{{TABLE}}', IP_INFO_TABLE)
 
             # Run the migration queries
             execute_migration(client, sql, file_name)

@@ -1,5 +1,5 @@
 -- Create IP info table to store data from ipinfo.io
-CREATE TABLE IF NOT EXISTS {{DATABASE}}.ipinfo (
+CREATE TABLE IF NOT EXISTS {{DATABASE}}.{{TABLE}} (
     ip String,
     hostname String,
     city String,
@@ -26,4 +26,4 @@ ORDER BY (ip, updated_at)
 SETTINGS index_granularity = 8192;
 
 -- Create index on IP to speed up lookups
-CREATE INDEX IF NOT EXISTS ipinfo_ip_idx ON {{DATABASE}}.ipinfo (ip) TYPE minmax GRANULARITY 1;
+CREATE INDEX IF NOT EXISTS ipinfo_ip_idx ON {{DATABASE}}.{{TABLE}} (ip) TYPE minmax GRANULARITY 1;

@@ -1,37 +1,23 @@
-FROM python:3.9-slim
+FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install build dependencies 
-RUN apt-get update && apt-get install -y \
-    gcc \
-    python3-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy requirements file and install dependencies
+# Every dependency ships a wheel for amd64 and arm64, so no compiler is needed.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Set up directory structure
 RUN mkdir -p /app/logs /app/migrations
 
-# Copy files into the container
 COPY migrations/ /app/migrations/
 COPY src/ /app/src/
 COPY entrypoint.sh /app/
-
-# Make entrypoint script executable
 RUN chmod +x /app/entrypoint.sh
 
-# Create non-root user for security
-RUN useradd -m crawler
-RUN chown -R crawler:crawler /app/logs
-
-# Switch to non-root user
+# Non-root; /app/logs holds health.log, crawler.log and the run summaries.
+RUN useradd -m crawler && chown -R crawler:crawler /app/logs
 USER crawler
 
-# Set Python path
-ENV PYTHONPATH=/app
+ENV PYTHONPATH=/app \
+    PYTHONUNBUFFERED=1
 
-# Use entrypoint script
 ENTRYPOINT ["/app/entrypoint.sh"]

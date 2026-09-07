@@ -1,358 +1,157 @@
 # IP Info Crawler
 
-A service that continuously fetches IP address information from ipinfo.io and stores it in a ClickHouse database.
+Enriches peer IPs seen by the [Nebula](https://github.com/dennis-tra/nebula) network crawler with
+[ipinfo.io](https://ipinfo.io) geolocation, into the ClickHouse table `crawlers_data.ipinfo`.
+It is a batch job: one run finds the IPs that appeared recently and are not yet in the table,
+looks them up under the API rate limit, writes them, prints one JSON summary line and exits.
 
-## Features
+## How a run works
 
-- Connects to ClickHouse Cloud
-- Creates necessary database and tables if they don't exist
-- Handles rate limiting for the ipinfo.io API (up to 10 requests per second)
-- Implements retry logic and error handling
-- Processes IPs in batches for efficiency
-- Processes large tables incrementally by month to avoid memory issues
-- Configurable fork digests for filtering IP addresses
-- Dockerized for easy deployment
-- Automatically sources IPs from your existing database tables
-- **One-time job mode** for batch processing without continuous operation
-
-## Requirements
-
-- Docker and Docker Compose
-- ClickHouse database (cloud or self-hosted)
-- ipinfo.io API token
-
-## Important Note About ClickHouse Connection
-
-This application uses the `clickhouse-connect` library for ClickHouse communication, which is better suited for ClickHouse Cloud connections than the `clickhouse-driver` package.
-
-## Quick Start
-
-### Continuous Mode (Default)
-1. Clone this repository
-2. Copy `.env.example` to `.env` and update with your credentials
-3. Run the service with Docker Compose
-
-```bash
-cp .env.example .env
-# Edit .env with your settings
-docker-compose up -d
+```
+source ──► work list ──► enrich ──► summary
 ```
 
-### One-Time Job Mode
-Run the crawler once to process a single batch of IPs and exit:
+1. **Source.** A read-only `SELECT` that yields a column named `ip`. The default source is the
+   Nebula window: visits in `[now - LOOKBACK_DAYS, now)` whose peer advertises a Gnosis fork digest.
+   Named presets (`--source hopr`) and ad-hoc queries (`--ips-query`) are sources too.
+2. **Work list.** The source is wrapped server-side:
+   `SELECT DISTINCT ip FROM (source) WHERE ip != '' AND ip NOT IN (SELECT ip FROM crawlers_data.ipinfo) LIMIT MAX_IPS_PER_RUN`.
+   The anti-join is the only state the crawler has: an IP is looked up once, ever. The Nebula
+   window is queried in `WINDOW_CHUNK_HOURS` chunks so no single query scans more than a day, and
+   the query carries `max_threads=2`, `max_execution_time=600` and a 1 GiB `max_memory_usage` fuse.
+3. **Enrich.** Each IP is checked once more against the table (guards against overlapping jobs),
+   fetched from `https://ipinfo.io/{ip}` at most once per `86400 / (IPINFO_RATE_LIMIT * 0.95)`
+   seconds, flattened and inserted.
+4. **Summary.** One line on stdout and in `logs/last_run_stats.json`:
+
+```json
+{"event":"run_summary","source":"nebula","mode":"once","window":{"since":"2026-09-05T12:00:00+00:00","until":"2026-09-07T12:00:00+00:00","lookback_days":2.0,"chunks":2},"candidates":370,"truncated":false,"looked_up":370,"saved_ok":366,"saved_failed":1,"lookup_failed":3,"skipped_existing":0,"skipped_shutdown":0,"clickhouse_errors":0,"duration_s":694.2,"dry_run":false,"exit_code":0}
+```
+
+Measured on production on 2026-09-07: a two-day window is about 370 candidates, 2.5 s of
+ClickHouse time and ~11 minutes of rate-limited API calls.
+
+### Failure semantics
+
+| What happened | Effect |
+|---|---|
+| ipinfo `400`/`404`, or an undecodable body | a row with `success = false` is written; the IP is never retried |
+| timeout, connection error, `5xx`, `429` after retries | counted in `lookup_failed`, **not** written; the next run's anti-join picks it up |
+| ipinfo `401`/`403` | fatal: `run_failure` with `reason: auth`, exit 1 |
+| work-list query fails (after one retry on memory-limit/timeout codes) | fatal: `reason: worklist`, exit 1 |
+| `looked_up >= 20` and `saved_ok == 0` | exit 1: a broken run must not look green |
+| bad `--since/--until`, unknown source | exit 2 |
+| `SIGTERM` (e.g. the Job deadline) | current IP finishes, the rest is `skipped_shutdown`, summary still printed, exit 0 |
+
+Everything else, including a truncated run, exits 0. Re-running is always safe.
+
+## Running
 
 ```bash
-# Local execution
+# One Nebula window run (what the Kubernetes CronJob does; CRAWLER_MODE=once in a container)
 python -m src.crawler --once
 
-# With custom batch size
-python -m src.crawler --once --batch-size 200
+# Explicit window, e.g. a backfill of August 2026, or a wider sweep
+python -m src.crawler --since 2026-08-01 --until 2026-09-01
+python -m src.crawler --once --lookback-days 30
 
-# Docker execution
-docker-compose run --rm -e CRAWLER_MODE=once ip-crawler
-```
+# Dry run: fetch and print the work list, no API calls, no inserts (also DRY_RUN=true / CRAWLER_MODE=dry-run)
+python -m src.crawler --once --dry-run
 
-## One-Time Job Mode
-
-The crawler can be run as a one-time job instead of a continuous service. This is useful for:
-- Processing batches on demand
-- Scheduled jobs (cron, Kubernetes CronJob)
-- Testing and development
-- Resource-constrained environments
-
-### Usage
-
-**Command Line:**
-```bash
-python -m src.crawler --once [--batch-size N]
-```
-
-**Docker:**
-```bash
-# Set environment variable
-export CRAWLER_MODE=once
-docker-compose up
-
-# Or inline
-docker-compose run --rm -e CRAWLER_MODE=once ip-crawler
-```
-
-**Output:**
-The one-time mode provides a summary of the batch processing results:
-```
-==================================================
-SINGLE RUN SUMMARY
-==================================================
-Total IPs processed: 150
-Successful: 147
-Failed: 3
-Success rate: 98.0%
-Total in database: 15,420
-Overall success rate: 96.8%
-==================================================
-```
-
-**Statistics File:**
-Results are saved to `logs/last_run_stats.json` for programmatic access.
-
-## Environment Variables
-
-All configuration is handled through environment variables in the `.env` file:
-
-### ClickHouse Connection
-- `CLICKHOUSE_HOST` - ClickHouse server hostname
-- `CLICKHOUSE_PORT` - ClickHouse server port
-- `CLICKHOUSE_USER` - ClickHouse username
-- `CLICKHOUSE_PASSWORD` - ClickHouse password
-- `CLICKHOUSE_DATABASE` - Database name (default: crawlers_data)
-- `CLICKHOUSE_SECURE` - Use secure connection (true/false)
-
-### Table Configuration
-- `IP_SOURCE_TABLE` - Table containing IP addresses to process (default: ip_addresses)
-- `IP_INFO_TABLE` - Table to store IP information (default: ipinfo)
-
-### IPInfo API Configuration
-- `IPINFO_API_TOKEN` - ipinfo.io API token
-- `IPINFO_RATE_LIMIT` - Requests per day limit (default: 1000)
-
-### Crawler Settings
-- `BATCH_SIZE` - Number of IPs to process in a batch (default: 50)
-- `SLEEP_INTERVAL` - Seconds to wait between batches (default: 60)
-- `REQUEST_TIMEOUT` - Seconds for API requests timeout (default: 10)
-- `MAX_RETRIES` - Maximum number of retries for failed requests (default: 3)
-- `RETRY_DELAY` - Seconds between retries (default: 5)
-- `FORK_DIGESTS` - Comma-separated list of fork digests to track (default: 0x56fdb5e0,0x824be431,0x21a6f836,0x3ebfd484,0x7d5aab40,0xf9ab5f85)
-- `CRAWLER_MODE` - Set to `once` for one-time job mode (Docker only)
-
-## Database Schema
-
-The application creates the main `ipinfo` table to store IP information:
-
-```sql
-CREATE TABLE ipinfo (
-    ip String,
-    hostname String,
-    city String,
-    region String,
-    country String,
-    loc String,
-    org String,
-    postal String,
-    timezone String,
-    asn String,
-    company String,
-    carrier String,
-    is_bogon Boolean DEFAULT false,
-    is_mobile Boolean DEFAULT false,
-    abuse_email String,
-    abuse_phone String,
-    error String,
-    attempts UInt8 DEFAULT 1,
-    success Boolean DEFAULT true,
-    created_at DateTime DEFAULT now(),
-    updated_at DateTime DEFAULT now()
-) ENGINE = MergeTree()
-ORDER BY (ip, updated_at);
-```
-
-## Adding IPs to Process
-
-The crawler automatically fetches IPs from the `nebula.visits` table that haven't been processed yet. It uses queries that process the table incrementally by month to avoid memory issues. The core filtering logic looks for:
-
-```sql
-SELECT DISTINCT toString(ip) AS ip
-FROM (
-    SELECT JSONExtractString(toString(peer_properties), 'ip') AS ip
-    FROM nebula.visits
-    WHERE toStartOfMonth(visit_started_at) = toDate('YYYY-MM-01')
-    AND (
-        JSONExtractString(toString(peer_properties), 'fork_digest') IN ('0x56fdb5e0', '0x824be431', '0x21a6f836', '0x3ebfd484', '0x7d5aab40', '0xf9ab5f85')
-        OR JSONExtractString(toString(peer_properties), 'next_fork_version') LIKE '%064%'
-    )
-)
-WHERE ip != ''
-LIMIT {batch_size}
-```
-
-### Explicit IP sources (`--source` / `--ips-query`)
-
-The crawl above is specific to the P2P census: it walks `nebula.visits` month by
-month via `PartitionTracker` and filters on beacon-chain fork digests. Other
-datasets have their own IP list, no month partitioning and no fork digests, so
-none of that applies to them.
-
-For those, pass an explicit source. Discovery is the only thing that differs —
-fetch, sanitize and insert all go through the same `process_ip()`, and the nebula
-path is untouched, so running a source cannot disturb an in-flight crawl.
-
-```bash
-# Named preset (see IP_SOURCE_QUERIES in src/config.py)
+# Explicit sources (IP_SOURCE=hopr in a container)
 python -m src.crawler --source hopr
+python -m src.crawler --ips-query "SELECT DISTINCT some_column AS ip FROM some.table"
 
-# Ad-hoc: any read-only SELECT returning a single IP column
-python -m src.crawler --ips-query "SELECT DISTINCT ip FROM some.table WHERE ip != ''"
+# Continuous: the same window run every SLEEP_INTERVAL seconds (anything else as CRAWLER_MODE)
+python -m src.crawler
 ```
 
-Both run once and exit. Before any API call the crawler de-duplicates the list
-and drops IPs already present in `ipinfo`, so the reported total is the number of
-requests actually needed.
+With Docker Compose: `docker compose run --rm ip-crawler-once`, `ip-crawler-dry-run`,
+`ip-crawler-source`, or `docker compose up -d ip-crawler` for the loop. Copy `.env.example` to
+`.env` first.
 
-**In a container, set `IP_SOURCE` — not `CRAWLER_MODE`:**
+### Explicit IP sources
 
-```bash
-docker-compose run --rm ip-crawler-source              # defaults to IP_SOURCE=hopr
-docker-compose run --rm -e IP_SOURCE=hopr ip-crawler
-```
-
-`CRAWLER_MODE=once` means "one batch of the **nebula** crawl". It reads like the
-right setting for a scheduled source job and is not — it would enrich no HOPR IPs,
-consume nebula crawl budget, and not error. The two are separate variables so that
-mistake cannot happen quietly. `IP_SOURCE` is checked first in `entrypoint.sh` and
-is unset in the nebula deployment, which therefore behaves exactly as before.
-
-**Exit codes** (written for a scheduled job): `1` if the IP list could not be
-resolved, or if it attempted some IPs and *every one* failed — a broken token or a
-dead API must not look green. `0` on partial failure, which is normal transient API
-behaviour and self-heals, since the un-enriched IPs are simply retried next run.
-`0` when there was nothing to do.
-
-Queries are validated as a single read-only statement: anything that is not a
-bare `SELECT`/`WITH`, contains a second statement, or contains a write keyword is
-refused. Presets can come from environment configuration, so they are checked
-rather than trusted.
-
-**Available presets**
+Presets live in `IP_SOURCE_QUERIES` in `src/config.py`. A preset returns one column named `ip`;
+the work-list wrapper handles de-duplication, the anti-join and the cap.
 
 | Preset | IPs | Source table |
 |---|---|---|
 | `hopr` | IPv4 addresses HOPR mixnet nodes announced on-chain | `HOPR_NODES_TABLE` (default `dbt.int_hopr_nodes`) |
 
-The `hopr` preset needs `int_hopr_nodes` to exist in the target database — it is
-built by dbt-cerebro. Enriching those IPs flips that model's `geo_source` from
-`unenriched` to `ipinfo` with no dbt change, because it already LEFT JOINs
-`ipinfo`.
+`hopr` reads a dbt model and writes a table dbt reads back, so it wants to run after dbt, and the
+crawler's ClickHouse user needs `SELECT` on the `dbt` database; without it the run exits 1 with an
+`ACCESS_DENIED` in the `run_failure` line. Ad-hoc queries must be a single bare `SELECT`/`WITH`;
+anything containing a write keyword or a second statement is refused.
 
-**Deployment prerequisite — the likely first-run failure.** This preset reads
-`dbt.int_hopr_nodes` and writes `crawlers_data.ipinfo`, so the crawler's ClickHouse
-user needs **SELECT on the `dbt` database**. The nebula crawl never touches `dbt`, so
-an existing deployment almost certainly does not have that grant, and the symptom is a
-plain `ACCESS_DENIED` on the source query rather than anything HOPR-shaped. The run
-exits non-zero in that case, so a scheduled job will surface it — but only if someone
-is watching the exit code.
+## Configuration
 
-Ordering: the preset reads a dbt model and writes a table dbt reads back, so it wants
-to run **after** dbt. It does not need strict sequencing though — if dbt runs daily
-anyway, the next run picks up whatever geography this wrote, and the worst case is a
-new node's country landing a day late.
+All values come from the environment (a local `.env` is loaded if present).
 
-## Incremental Processing
+| Variable | Default | Meaning |
+|---|---|---|
+| `CLICKHOUSE_HOST` / `CLICKHOUSE_PORT` | `localhost` / `8443` | HTTP(S) port; clickhouse-connect does not speak the native protocol |
+| `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` | `default` / empty | |
+| `CLICKHOUSE_DATABASE` / `IP_INFO_TABLE` | `crawlers_data` / `ipinfo` | target table; migrations use the same names |
+| `CLICKHOUSE_SECURE` | `true` | TLS |
+| `NEBULA_VISITS_TABLE` | `nebula.visits` | source of the default window job |
+| `IPINFO_API_TOKEN` | empty | required for lookups |
+| `IPINFO_RATE_LIMIT` | `50000` | requests per day; `0` disables throttling |
+| `REQUEST_TIMEOUT` / `MAX_RETRIES` / `RETRY_DELAY` | `10` / `3` / `5` | per-IP HTTP behaviour |
+| `LOOKBACK_DAYS` | `2` | window length for `--once` and continuous mode |
+| `WINDOW_CHUNK_HOURS` | `24` | one ClickHouse query per chunk |
+| `MAX_IPS_PER_RUN` | `10000` | cap on lookups per run (about 5 h at the default rate) |
+| `FORK_DIGESTS` | Gnosis digests | comma-separated; peers advertising one of these are Gnosis peers |
+| `DRY_RUN` | `false` | `true`: print the work list only |
+| `CRAWLER_MODE` | continuous | `once` / `single-run` / `dry-run` / anything else (entrypoint only) |
+| `IP_SOURCE` | unset | run a named preset instead of the window job (entrypoint only) |
+| `BATCH_SIZE` | `50` | progress-log cadence |
+| `SLEEP_INTERVAL` | `3600` | pause between runs in continuous mode |
+| `HOPR_NODES_TABLE` | `dbt.int_hopr_nodes` | source table of the `hopr` preset |
 
-To handle very large tables without encountering memory limitations, the crawler:
+## Schema
 
-1. Processes data month by month using the table's time partitioning
-2. Maintains state in a JSON file to track which months have been processed
-3. Automatically resumes from where it left off if restarted
+`src/migrations.py` runs `migrations/*.sql` on every start; the files are idempotent
+(`IF NOT EXISTS`) and templated on `{{DATABASE}}` / `{{TABLE}}`.
 
-## Updating Fork Digests
-
-The list of fork digests to track can be updated in two ways:
-
-1. By changing the `FORK_DIGESTS` environment variable in your `.env` file and restarting the container
-2. By updating the environment variable while the container is running (it will detect the change automatically)
-
-## Monitoring
-
-The crawler creates log files in the `logs` directory, which is mounted as a volume. You can monitor the crawler's activity with:
-
-```bash
-docker-compose logs -f
+```sql
+CREATE TABLE IF NOT EXISTS crawlers_data.ipinfo (
+    ip String, hostname String, city String, region String, country String, loc String,
+    org String, postal String, timezone String, asn String, company String, carrier String,
+    is_bogon Boolean DEFAULT false, is_mobile Boolean DEFAULT false,
+    abuse_email String, abuse_phone String,
+    error String, attempts UInt8 DEFAULT 1, success Boolean DEFAULT true,
+    created_at DateTime DEFAULT now(), updated_at DateTime DEFAULT now()
+) ENGINE = MergeTree() ORDER BY (ip, updated_at);
 ```
 
-The logs directory also contains:
-- `crawler.log` - Main application logs
-- `health.log` - Current status for healthcheck
-- `partition_state.json` - Tracks which months have been processed
-- `last_run_stats.json` - Statistics from the last one-time job run
+The table is a plain `MergeTree`: an IP that was written twice (two overlapping jobs, or a retry
+whose first insert succeeded) has two rows. Readers that need one row per IP should use
+`LIMIT 1 BY ip`.
 
-## Health Checks
+## Operations notes
 
-The container includes a health check that verifies the crawler is running by checking for the existence of a health log file.
+- **Scheduling.** Intended as a Kubernetes CronJob with `concurrencyPolicy: Forbid` and an
+  `activeDeadlineSeconds` around 8 h, plus an optional weekly sweep with `LOOKBACK_DAYS=30`. A run
+  that stops at the deadline or the cap leaves the rest for the next run; nothing is lost.
+- **Health.** `logs/health.log` is rewritten at start, every `BATCH_SIZE` IPs and at the end; the
+  container probe only checks that it exists.
+- **Alerting.** Key on the summary line: absence of `event="run_summary"` for 26 h, `exit_code != 0`,
+  or `truncated=true` on the daily job.
+- **Budget.** `MAX_IPS_PER_RUN` is the throttle if the ipinfo plan is smaller than the daily limit
+  suggests; check the plan before enabling a wide sweep.
 
 ## Development
 
-### Project Structure
-
-```
-.
-├── .env.example           # Template for environment variables
-├── docker-compose.yml     # Docker Compose configuration
-├── Dockerfile             # Docker container definition
-├── entrypoint.sh          # Container entrypoint script
-├── migrations/            # Database migration SQL files
-│   ├── 01_create_database.sql
-│   ├── 02_create_ipinfo_table.sql
-├── README.md              # Project documentation
-├── requirements.txt       # Python dependencies
-└── src/                   # Source code
-    ├── __init__.py
-    ├── config.py          # Configuration management
-    ├── crawler.py         # Main crawler logic
-    ├── db.py              # Database interaction
-    ├── migrations.py      # Database migration runner
-    ├── partition_tracker.py # Manages incremental processing
-    └── utils.py           # Utility functions
+```bash
+python -m venv .venv && . .venv/bin/activate
+pip install -r requirements-dev.txt
+python -m pytest
 ```
 
-### Running Locally for Development
+Tests mock ClickHouse and HTTP; nothing in the suite touches the network. CI runs them before
+every image build; images are pushed to `ghcr.io/gnosischain/gc-ip_crawler:<short sha>` and
+`:latest` on every push to `main`.
 
-For development without Docker:
-
-1. Create a virtual environment and install requirements
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   pip install -r requirements.txt
-   ```
-
-2. Create a `.env` file with your configuration
-3. Run the migrations
-   ```bash
-   python -m src.migrations
-   ```
-4. Start the crawler (continuous mode)
-   ```bash
-   python -m src.crawler
-   ```
-5. Or run once
-   ```bash
-   python -m src.crawler --once
-   ```
-
-## Troubleshooting
-
-### Memory Limit Exceeded
-
-If you were previously encountering `MEMORY_LIMIT_EXCEEDED` errors when querying large tables, the incremental processing approach should solve this issue. The crawler now processes data month by month to keep memory usage low.
-
-### Checking Processing Status
-
-To check which months have been processed, examine the `partition_state.json` file in the logs directory. It contains information about:
-- The last fully processed month
-- The current month being processed
-- Whether the current month is complete
-- The list of fork digests being tracked
-
-### Resetting Processing
-
-If you need to start processing from scratch, simply stop the container and delete the `partition_state.json` file from the logs directory.
-
-### No New IPs Found
-
-If the one-time job reports "No new IPs to process", it means:
-- All IPs in the current partition have already been processed
-- The current partition is complete and no new partitions are available
-- Check `partition_state.json` to see the current processing status
-
-## License
-
-This project is licensed under the [MIT License](LICENSE).
+Layout: `src/sources.py` (pure: windows, SQL, summaries), `src/db.py` (ClickHouse), `src/crawler.py`
+(lookups, runs, CLI), `src/utils.py` (response flattening), `src/migrations.py`, `src/config.py`.
