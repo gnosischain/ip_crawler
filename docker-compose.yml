@@ -1,9 +1,12 @@
 services:
+  # Continuous loop: one window run every SLEEP_INTERVAL seconds.
   ip-crawler:
     build: .
     restart: always
     env_file:
       - .env
+    environment:
+      - CRAWLER_MODE=continuous
     volumes:
       - ./logs:/app/logs
     healthcheck:
@@ -17,6 +20,8 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  # One nebula window run, then exit (what the Kubernetes CronJob does).
   ip-crawler-once:
     build: .
     env_file:
@@ -26,10 +31,21 @@ services:
     volumes:
       - ./logs:/app/logs
     restart: "no"
+
+  # Print the work list only: no ipinfo calls, no inserts, no migrations.
+  ip-crawler-dry-run:
+    build: .
+    env_file:
+      - .env
+    environment:
+      - CRAWLER_MODE=dry-run
+      - DRY_RUN=true
+    volumes:
+      - ./logs:/app/logs
+    restart: "no"
+
   # Enrich one named IP source (see IP_SOURCE_QUERIES in src/config.py) and exit.
-  # Note it sets IP_SOURCE and NOT CRAWLER_MODE: CRAWLER_MODE=once would run a batch
-  # of the nebula crawl instead, silently enriching no HOPR IPs. No healthcheck --
-  # this is a short-lived job, not a service.
+  # Keyed on IP_SOURCE, not CRAWLER_MODE: CRAWLER_MODE=once is the nebula job.
   ip-crawler-source:
     build: .
     env_file:
@@ -38,4 +54,4 @@ services:
       - IP_SOURCE=${IP_SOURCE:-hopr}
     volumes:
       - ./logs:/app/logs
-    restart: "no" 
+    restart: "no"
