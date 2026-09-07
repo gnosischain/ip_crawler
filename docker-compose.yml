@@ -25,4 +25,17 @@ services:
       - CRAWLER_MODE=once
     volumes:
       - ./logs:/app/logs
+    restart: "no"
+  # Enrich one named IP source (see IP_SOURCE_QUERIES in src/config.py) and exit.
+  # Note it sets IP_SOURCE and NOT CRAWLER_MODE: CRAWLER_MODE=once would run a batch
+  # of the nebula crawl instead, silently enriching no HOPR IPs. No healthcheck --
+  # this is a short-lived job, not a service.
+  ip-crawler-source:
+    build: .
+    env_file:
+      - .env
+    environment:
+      - IP_SOURCE=${IP_SOURCE:-hopr}
+    volumes:
+      - ./logs:/app/logs
     restart: "no" 

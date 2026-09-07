@@ -17,7 +17,7 @@ from requests.exceptions import RequestException, Timeout
 from src.config import (
     IPINFO_API_TOKEN, BATCH_SIZE, SLEEP_INTERVAL, 
     REQUEST_TIMEOUT, MAX_RETRIES, RETRY_DELAY, RATE_LIMIT_SECONDS,
-    LOG_PATH
+    LOG_PATH, IP_SOURCE_QUERIES
 )
 from src.db import Database
 from src.utils import sanitize_ip_info
@@ -143,6 +143,61 @@ class IPInfoCrawler:
             self.db.save_ip_info(error_info, success=False, error=str(e))
             
             return False
+
+    def run_ip_source(self, query: str, source_label: str = 'custom') -> Dict[str, Any]:
+        """Enrich an explicit list of IPs from a SELECT, bypassing PartitionTracker.
+
+        Why this exists: the default crawl discovers IPs by walking nebula.visits
+        month by month, filtered on beacon-chain fork digests. Other datasets (the
+        first being HOPR mixnet nodes, whose IPs are announced on-chain and
+        extracted in dbt.int_hopr_nodes) have their own IP list, no month
+        partitioning and no fork digests, so none of that machinery applies.
+
+        Only the DISCOVERY differs. Fetch, sanitize and insert all go through the
+        same process_ip(), so enrichment stays identical no matter the source and
+        the nebula path is left completely untouched.
+
+        Always terminates: it walks a finite list once. No tracker state is read
+        or written, so running it cannot disturb an in-flight nebula crawl.
+        """
+        logger.info(f"Running explicit IP source: {source_label}")
+        stats = {
+            'source': source_label, 'total_ips': 0, 'successful': 0,
+            'failed': 0, 'skipped_existing': 0,
+        }
+
+        try:
+            ips = self.db.get_ips_from_query(query)
+        except Exception as e:
+            logger.error(f"Could not resolve IP source {source_label!r}: {e}")
+            stats['error'] = str(e)
+            return stats
+
+        stats['total_ips'] = len(ips)
+        if not ips:
+            logger.info(f"Source {source_label!r}: nothing to enrich, all IPs already stored")
+            return stats
+
+        logger.info(f"Source {source_label!r}: fetching {len(ips)} IP(s) from ipinfo.io")
+        for index, ip in enumerate(ips, start=1):
+            if not self.running:
+                logger.info("Shutdown requested, stopping IP source run")
+                break
+            if self.process_ip(ip):
+                stats['successful'] += 1
+            else:
+                stats['failed'] += 1
+            if index % 100 == 0:
+                logger.info(f"Source {source_label!r}: {index}/{len(ips)} processed")
+
+        stats['success_rate'] = round(
+            100 * stats['successful'] / stats['total_ips'], 2
+        ) if stats['total_ips'] else 0.0
+        logger.info(
+            f"Source {source_label!r} complete: {stats['successful']} ok, "
+            f"{stats['failed']} failed of {stats['total_ips']}"
+        )
+        return stats
 
     def run_single_batch(self) -> Dict[str, Any]:
         """Run a single batch and return statistics."""
@@ -308,8 +363,17 @@ def main():
                        help='Run once and exit instead of continuous mode')
     parser.add_argument('--batch-size', type=int, 
                        help='Override batch size for single run')
+    parser.add_argument('--source', choices=sorted(IP_SOURCE_QUERIES),
+                       help='Enrich a named explicit IP source instead of crawling '
+                            'nebula.visits (e.g. "hopr"). Runs once and exits.')
+    parser.add_argument('--ips-query',
+                       help='Enrich IPs from an ad-hoc read-only SELECT returning one '
+                            'IP column. Mutually exclusive with --source.')
     
     args = parser.parse_args()
+    
+    if args.source and args.ips_query:
+        parser.error('--source and --ips-query are mutually exclusive')
     
     # Override batch size if specified
     if args.batch_size:
@@ -319,6 +383,55 @@ def main():
     
     try:
         logger.info("Starting IP Info Crawler")
+
+        # Explicit-source mode: finite list, runs once, never touches the
+        # PartitionTracker state the nebula crawl depends on.
+        if args.source or args.ips_query:
+            crawler = IPInfoCrawler(single_run_mode=True)
+            if args.source:
+                query, label = IP_SOURCE_QUERIES[args.source], args.source
+            else:
+                query, label = args.ips_query, 'ad-hoc'
+            result = crawler.run_ip_source(query, source_label=label)
+
+            print()
+            print("="*50)
+            print(f"IP SOURCE RUN SUMMARY ({result['source']})")
+            print("="*50)
+            print(f"IPs needing enrichment: {result['total_ips']}")
+            print(f"Successful: {result['successful']}")
+            print(f"Failed: {result['failed']}")
+            if 'success_rate' in result:
+                print(f"Success rate: {result['success_rate']}%")
+            if 'error' in result:
+                print(f"ERROR: {result['error']}")
+            print("="*50)
+
+            # Exit code contract, written for a scheduled job rather than a human:
+            #
+            #   error                     -> 1  (could not even resolve the IP list)
+            #   tried some, none worked   -> 1  (bad token, rate limit, ipinfo down)
+            #   partial failures          -> 0  (see below)
+            #   nothing to do             -> 0  (everything already enriched)
+            #
+            # Total failure has to be non-zero or a broken run looks green forever: the
+            # job "succeeds" every night while enriching nothing, and the only symptom
+            # is geo that quietly stops improving.
+            #
+            # Partial failure stays SUCCESS on purpose. A handful of IPs failing is
+            # normal transient API behaviour, and it is self-healing -- those IPs are
+            # still missing from ipinfo, so the next run simply retries them. Failing
+            # the job would raise an alert for something that fixes itself.
+            attempted = result.get('total_ips', 0)
+            succeeded = result.get('successful', 0)
+            total_failure = attempted > 0 and succeeded == 0
+            if total_failure:
+                logger.error(
+                    f"IP source {result['source']!r}: all {attempted} enrichment(s) "
+                    "failed - treating as job failure"
+                )
+            sys.exit(1 if (result.get('error') or total_failure) else 0)
+
         crawler = IPInfoCrawler(single_run_mode=args.once)
         result = crawler.run_crawler()
         

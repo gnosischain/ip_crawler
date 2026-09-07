@@ -174,6 +174,77 @@ WHERE ip != ''
 LIMIT {batch_size}
 ```
 
+### Explicit IP sources (`--source` / `--ips-query`)
+
+The crawl above is specific to the P2P census: it walks `nebula.visits` month by
+month via `PartitionTracker` and filters on beacon-chain fork digests. Other
+datasets have their own IP list, no month partitioning and no fork digests, so
+none of that applies to them.
+
+For those, pass an explicit source. Discovery is the only thing that differs —
+fetch, sanitize and insert all go through the same `process_ip()`, and the nebula
+path is untouched, so running a source cannot disturb an in-flight crawl.
+
+```bash
+# Named preset (see IP_SOURCE_QUERIES in src/config.py)
+python -m src.crawler --source hopr
+
+# Ad-hoc: any read-only SELECT returning a single IP column
+python -m src.crawler --ips-query "SELECT DISTINCT ip FROM some.table WHERE ip != ''"
+```
+
+Both run once and exit. Before any API call the crawler de-duplicates the list
+and drops IPs already present in `ipinfo`, so the reported total is the number of
+requests actually needed.
+
+**In a container, set `IP_SOURCE` — not `CRAWLER_MODE`:**
+
+```bash
+docker-compose run --rm ip-crawler-source              # defaults to IP_SOURCE=hopr
+docker-compose run --rm -e IP_SOURCE=hopr ip-crawler
+```
+
+`CRAWLER_MODE=once` means "one batch of the **nebula** crawl". It reads like the
+right setting for a scheduled source job and is not — it would enrich no HOPR IPs,
+consume nebula crawl budget, and not error. The two are separate variables so that
+mistake cannot happen quietly. `IP_SOURCE` is checked first in `entrypoint.sh` and
+is unset in the nebula deployment, which therefore behaves exactly as before.
+
+**Exit codes** (written for a scheduled job): `1` if the IP list could not be
+resolved, or if it attempted some IPs and *every one* failed — a broken token or a
+dead API must not look green. `0` on partial failure, which is normal transient API
+behaviour and self-heals, since the un-enriched IPs are simply retried next run.
+`0` when there was nothing to do.
+
+Queries are validated as a single read-only statement: anything that is not a
+bare `SELECT`/`WITH`, contains a second statement, or contains a write keyword is
+refused. Presets can come from environment configuration, so they are checked
+rather than trusted.
+
+**Available presets**
+
+| Preset | IPs | Source table |
+|---|---|---|
+| `hopr` | IPv4 addresses HOPR mixnet nodes announced on-chain | `HOPR_NODES_TABLE` (default `dbt.int_hopr_nodes`) |
+
+The `hopr` preset needs `int_hopr_nodes` to exist in the target database — it is
+built by dbt-cerebro. Enriching those IPs flips that model's `geo_source` from
+`unenriched` to `ipinfo` with no dbt change, because it already LEFT JOINs
+`ipinfo`.
+
+**Deployment prerequisite — the likely first-run failure.** This preset reads
+`dbt.int_hopr_nodes` and writes `crawlers_data.ipinfo`, so the crawler's ClickHouse
+user needs **SELECT on the `dbt` database**. The nebula crawl never touches `dbt`, so
+an existing deployment almost certainly does not have that grant, and the symptom is a
+plain `ACCESS_DENIED` on the source query rather than anything HOPR-shaped. The run
+exits non-zero in that case, so a scheduled job will surface it — but only if someone
+is watching the exit code.
+
+Ordering: the preset reads a dbt model and writes a table dbt reads back, so it wants
+to run **after** dbt. It does not need strict sequencing though — if dbt runs daily
+anyway, the next run picks up whatever geography this wrote, and the worst case is a
+new node's country landing a day late.
+
 ## Incremental Processing
 
 To handle very large tables without encountering memory limitations, the crawler:
