@@ -22,11 +22,35 @@ source ──► work list ──► enrich ──► summary
 3. **Enrich.** Each IP is checked once more against the table (guards against overlapping jobs),
    fetched from `https://ipinfo.io/{ip}` at most once per `86400 / (IPINFO_RATE_LIMIT * 0.95)`
    seconds, flattened and inserted.
-4. **Summary.** One line on stdout and in `logs/last_run_stats.json`:
+4. **Summary.** One line on stdout and in `logs/last_run_stats.json`. Top-level counters are the
+   whole run; `phases` carries each phase's own numbers (see the next section):
 
 ```json
-{"event":"run_summary","source":"nebula","mode":"once","window":{"since":"2026-09-05T12:00:00+00:00","until":"2026-09-07T12:00:00+00:00","lookback_days":2.0,"chunks":2},"candidates":370,"truncated":false,"looked_up":370,"saved_ok":366,"saved_failed":1,"lookup_failed":3,"skipped_existing":0,"skipped_shutdown":0,"clickhouse_errors":0,"duration_s":694.2,"dry_run":false,"exit_code":0}
+{"event":"run_summary","source":"nebula","mode":"once","window":{"since":"2026-09-05T12:00:00+00:00","until":"2026-09-07T12:00:00+00:00","lookback_days":2.0,"chunks":2},"candidates":378,"truncated":false,"looked_up":378,"saved_ok":374,"saved_failed":1,"lookup_failed":3,"skipped_existing":0,"skipped_shutdown":0,"clickhouse_errors":0,"duration_s":760.1,"dry_run":false,"exit_code":0,"phases":{"recent":{"window":{"since":"2026-09-05T12:00:00+00:00","until":"2026-09-07T12:00:00+00:00","lookback_days":2.0,"chunks":2},"candidates":370,"truncated":false,"looked_up":370,"saved_ok":366,"saved_failed":1,"lookup_failed":3,"skipped_existing":0,"skipped_shutdown":0,"clickhouse_errors":0,"duration_s":694.2},"sweep":{"window":{"since":"2026-08-08T12:00:00+00:00","until":"2026-09-05T12:00:00+00:00","lookback_days":28.0,"chunks":28},"candidates":8,"truncated":false,"looked_up":8,"saved_ok":8,"saved_failed":0,"lookup_failed":0,"skipped_existing":0,"skipped_shutdown":0,"clickhouse_errors":0,"duration_s":65.9,"budget_exhausted":false,"max_ips":500,"max_seconds":3600}}}
 ```
+
+### The sweep phase (backlog repair)
+
+`--once` is a **two-phase** run. Phase one is the recent window above. Phase two, the sweep, walks
+`[now - SWEEP_LOOKBACK_DAYS, now - LOOKBACK_DAYS)` with the same chunked anti-join query,
+**oldest chunk first**, under its own small cap (`SWEEP_MAX_IPS_PER_RUN`, default 500 ≈ 15 min of
+lookups) and wall-clock budget (`SWEEP_MAX_SECONDS`, default 1 h). The two windows are contiguous
+and never overlap.
+
+Why it exists: the recent window keeps up with new peers but cannot *recover*. A peer whose visits
+all predate the window and that was never enriched (an outage, a night at the cap) would otherwise
+stay invisible. With the sweep, such a backlog drains by itself over the following nights, oldest
+days first, and because the anti-join excludes everything already enriched, a clean history costs
+only ~30 two-second queries and zero API calls per night. One CronJob does both, so nothing can
+overlap and the monthly budget is bounded by construction: at most
+`MAX_IPS_PER_RUN + SWEEP_MAX_IPS_PER_RUN` lookups per night.
+
+Reading the summary: top-level `truncated` and `window` describe the recent phase only, so an alert
+on `truncated` still means "the nightly window itself hit the cap". `phases.sweep.truncated` or
+`phases.sweep.budget_exhausted` mean "still draining, more tomorrow". A sweep whose work-list query
+fails is recorded under `phases.sweep.error` with `clickhouse_errors = 1` and does **not** fail the
+run: the recent phase already did the night's job. `SWEEP_LOOKBACK_DAYS=0` disables the phase;
+explicit `--since/--until` runs are always single-phase.
 
 Measured on production on 2026-09-07: a two-day window is about 370 candidates, 2.5 s of
 ClickHouse time and ~11 minutes of rate-limited API calls.
@@ -48,7 +72,8 @@ Everything else, including a truncated run, exits 0. Re-running is always safe.
 ## Running
 
 ```bash
-# One Nebula window run (what the Kubernetes CronJob does; CRAWLER_MODE=once in a container)
+# The nightly job (what the Kubernetes CronJob does; CRAWLER_MODE=once in a container):
+# recent window, then the sweep phase
 python -m src.crawler --once
 
 # Explicit window, e.g. a backfill of August 2026, or a wider sweep
@@ -100,7 +125,10 @@ All values come from the environment (a local `.env` is loaded if present).
 | `REQUEST_TIMEOUT` / `MAX_RETRIES` / `RETRY_DELAY` | `10` / `3` / `5` | per-IP HTTP behaviour |
 | `LOOKBACK_DAYS` | `2` | window length for `--once` and continuous mode |
 | `WINDOW_CHUNK_HOURS` | `24` | one ClickHouse query per chunk |
-| `MAX_IPS_PER_RUN` | `10000` | cap on lookups per run (about 5 h at the default rate) |
+| `MAX_IPS_PER_RUN` | `10000` | cap on lookups in the recent phase (about 5 h at the default rate) |
+| `SWEEP_LOOKBACK_DAYS` | `30` | how far back the sweep phase repairs; `0` disables it |
+| `SWEEP_MAX_IPS_PER_RUN` | `500` | cap on lookups in the sweep phase per run |
+| `SWEEP_MAX_SECONDS` | `3600` | wall-clock budget for the sweep phase; `0` = unbounded |
 | `FORK_DIGESTS` | Gnosis digests | comma-separated; peers advertising one of these are Gnosis peers |
 | `DRY_RUN` | `false` | `true`: print the work list only |
 | `CRAWLER_MODE` | continuous | `once` / `single-run` / `dry-run` / anything else (entrypoint only) |
@@ -131,13 +159,15 @@ whose first insert succeeded) has two rows. Readers that need one row per IP sho
 
 ## Operations notes
 
-- **Scheduling.** Intended as a Kubernetes CronJob with `concurrencyPolicy: Forbid` and an
-  `activeDeadlineSeconds` around 8 h, plus an optional weekly sweep with `LOOKBACK_DAYS=30`. A run
-  that stops at the deadline or the cap leaves the rest for the next run; nothing is lost.
+- **Scheduling.** One Kubernetes CronJob with `concurrencyPolicy: Forbid` and an
+  `activeDeadlineSeconds` around 8–10 h is enough; the sweep phase replaces any separate weekly
+  job. Worst case per night is the recent cap plus the sweep cap plus the sweep's time budget. A
+  run that stops at the deadline or a cap leaves the rest for the next run; nothing is lost.
 - **Health.** `logs/health.log` is rewritten at start, every `BATCH_SIZE` IPs and at the end; the
   container probe only checks that it exists.
 - **Alerting.** Key on the summary line: absence of `event="run_summary"` for 26 h, `exit_code != 0`,
-  or `truncated=true` on the daily job.
+  `truncated=true` (the recent window hit its cap), or `clickhouse_errors > 0` (the sweep's query
+  is failing night after night). `phases.sweep.truncated` on its own is normal while a backlog drains.
 - **Budget.** `MAX_IPS_PER_RUN` is the throttle if the ipinfo plan is smaller than the daily limit
   suggests; check the plan before enabling a wide sweep.
 

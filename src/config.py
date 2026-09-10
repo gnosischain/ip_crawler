@@ -37,6 +37,15 @@ LOOKBACK_DAYS = _int("LOOKBACK_DAYS", 2)
 WINDOW_CHUNK_HOURS = _int("WINDOW_CHUNK_HOURS", 24)
 MAX_IPS_PER_RUN = _int("MAX_IPS_PER_RUN", 10000)
 
+# --- Sweep phase (backlog repair inside the same nightly run) --------------------
+# After the recent window, the run walks [now - SWEEP_LOOKBACK_DAYS, now - LOOKBACK_DAYS)
+# oldest chunk first under its own small cap and wall-clock budget. Anything the recent
+# window missed (an outage, a night at the cap) drains over the following nights; once
+# nothing is missing the phase costs ~30 cheap queries and zero lookups. 0 disables.
+SWEEP_LOOKBACK_DAYS = _int("SWEEP_LOOKBACK_DAYS", 30)
+SWEEP_MAX_IPS_PER_RUN = _int("SWEEP_MAX_IPS_PER_RUN", 500)   # ~15 min of lookups per night
+SWEEP_MAX_SECONDS = _int("SWEEP_MAX_SECONDS", 3600)           # wall clock for the whole phase; 0 = unbounded
+
 # Fetch and print the work list, no ipinfo calls, no inserts.
 DRY_RUN = _bool("DRY_RUN")
 
