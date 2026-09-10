@@ -21,12 +21,13 @@ from requests.exceptions import RequestException
 from src.config import (
     BATCH_SIZE, DRY_RUN, FORK_DIGESTS, IP_SOURCE_QUERIES, IPINFO_API_TOKEN, LOG_PATH,
     LOOKBACK_DAYS, MAX_IPS_PER_RUN, MAX_RETRIES, NEBULA_VISITS_TABLE, RATE_LIMIT_SECONDS,
-    REQUEST_TIMEOUT, RETRY_DELAY, SLEEP_INTERVAL, WINDOW_CHUNK_HOURS,
+    REQUEST_TIMEOUT, RETRY_DELAY, SLEEP_INTERVAL, SWEEP_LOOKBACK_DAYS, SWEEP_MAX_IPS_PER_RUN,
+    SWEEP_MAX_SECONDS, WINDOW_CHUNK_HOURS,
 )
 from src.db import Database, WorkListError
 from src.sources import (
-    build_summary, chunk_window, compute_window, exit_code_for, nebula_params,
-    nebula_source_sql, utcnow, validate_readonly_select,
+    build_summary, chunk_window, compute_sweep_window, compute_window, exit_code_for,
+    merge_summaries, nebula_params, nebula_source_sql, utcnow, validate_readonly_select,
 )
 from src.utils import sanitize_ip_info
 
@@ -101,6 +102,7 @@ class IPInfoCrawler:
         self.dry_run = bool(dry_run)
         self._sleep = sleep
         self.running = True
+        self.last_stop_reason: Optional[str] = None  # "signal" | "deadline" | None, set by run_work_list
         self._install_signal_handlers()
         logger.info(
             f"Crawler ready: fork_digests={self.fork_digests} dry_run={self.dry_run} "
@@ -182,9 +184,17 @@ class IPInfoCrawler:
     # -- runs -----------------------------------------------------------------------
     def run_work_list(self, ips: Sequence[str], source: str, mode: str,
                       window: Optional[Dict[str, Any]] = None, truncated: bool = False,
-                      started_at: Optional[float] = None, clickhouse_errors: int = 0) -> Dict[str, Any]:
-        """Enrich a finished work list and return the run summary."""
+                      started_at: Optional[float] = None, clickhouse_errors: int = 0,
+                      deadline: Optional[float] = None, worklist_file: str = "worklist.txt",
+                      log_tag: Optional[str] = None) -> Dict[str, Any]:
+        """Enrich a finished work list and return the run summary.
+
+        `deadline` is a time.monotonic() value; past it the remaining IPs are left for the
+        next run (counted as skipped_shutdown, last_stop_reason = "deadline").
+        """
         started = started_at if started_at is not None else time.monotonic()
+        self.last_stop_reason = None
+        tag = log_tag or source
         ips = list(ips)
         counts = {"saved_ok": 0, "saved_failed": 0, "lookup_failed": 0,
                   "skipped_existing": 0, "skipped_shutdown": 0}
@@ -192,27 +202,30 @@ class IPInfoCrawler:
                        "lookup_failed": "lookup_failed", "skipped_existing": "skipped_existing"}
         looked_up = 0
         write_health(f"{mode} run started, {len(ips)} candidates")
-        logger.info(f"[{source}] {len(ips)} IP(s) to look up" + (" (truncated)" if truncated else ""))
+        logger.info(f"[{tag}] {len(ips)} IP(s) to look up" + (" (truncated)" if truncated else ""))
 
         if self.dry_run:
-            path = os.path.join(LOG_PATH, "worklist.txt")
+            path = os.path.join(LOG_PATH, worklist_file)
             with open(path, "w") as fh:
                 fh.write("\n".join(ips) + ("\n" if ips else ""))
             preview = ", ".join(ips[:50])
-            logger.info(f"[{source}] dry run: full list in {path}; first {min(50, len(ips))}: {preview}")
+            logger.info(f"[{tag}] dry run: full list in {path}; first {min(50, len(ips))}: {preview}")
             mode = "dry_run"
         else:
             for index, ip in enumerate(ips, start=1):
-                if not self.running:
+                out_of_time = deadline is not None and time.monotonic() >= deadline
+                if not self.running or out_of_time:
+                    self.last_stop_reason = "signal" if not self.running else "deadline"
                     counts["skipped_shutdown"] = len(ips) - (index - 1)
-                    logger.info(f"[{source}] stopping early, {counts['skipped_shutdown']} IP(s) left for the next run")
+                    logger.info(f"[{tag}] stopping early ({self.last_stop_reason}), "
+                                f"{counts['skipped_shutdown']} IP(s) left for the next run")
                     break
                 outcome = self.process_ip(ip)
                 counts[outcome_key[outcome]] += 1
                 if outcome != "skipped_existing":
                     looked_up += 1
                 if index % max(1, BATCH_SIZE) == 0:
-                    logger.info(f"[{source}] {index}/{len(ips)} processed: {counts}")
+                    logger.info(f"[{tag}] {index}/{len(ips)} processed: {counts}")
                     write_health(f"{mode} run in progress, {index}/{len(ips)}")
 
         summary = build_summary(
@@ -225,18 +238,30 @@ class IPInfoCrawler:
         write_health(f"{mode} run finished")
         return summary
 
-    def run_nebula_window(self, since: datetime, until: datetime, mode: str = "once") -> Dict[str, Any]:
-        """The default job: new IPs seen in nebula.visits within [since, until)."""
+    def run_nebula_window(self, since: datetime, until: datetime, mode: str = "once", *,
+                          phase: str = "recent", max_ips: Optional[int] = None,
+                          deadline: Optional[float] = None) -> Dict[str, Any]:
+        """New IPs seen in nebula.visits within [since, until), oldest chunk first.
+
+        `max_ips` defaults to MAX_IPS_PER_RUN; `deadline` (time.monotonic()) bounds both
+        the chunk queries and the lookups. `phase` only labels logs and the dry-run file.
+        """
         started = time.monotonic()
+        cap = max_ips if max_ips is not None else MAX_IPS_PER_RUN
+        tag = "nebula" if phase == "recent" else f"nebula/{phase}"
         chunks = chunk_window(since, until, WINDOW_CHUNK_HOURS)
         inner_sql = nebula_source_sql(NEBULA_VISITS_TABLE)
         ips: List[str] = []
         seen = set()
         truncated = False
-        logger.info(f"[nebula] window {since.isoformat()} -> {until.isoformat()} in {len(chunks)} chunk(s)")
+        logger.info(f"[{tag}] window {since.isoformat()} -> {until.isoformat()} in {len(chunks)} chunk(s), cap {cap}")
         for chunk_since, chunk_until in chunks:
-            remaining = MAX_IPS_PER_RUN - len(ips)
+            remaining = cap - len(ips)
             if remaining <= 0:
+                truncated = True
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                logger.warning(f"[{tag}] time budget spent before chunk {chunk_since:%Y-%m-%d %H:%M}; the rest waits for the next run")
                 truncated = True
                 break
             chunk_ips, chunk_truncated = self.db.fetch_work_list(
@@ -249,19 +274,57 @@ class IPInfoCrawler:
                     ips.append(ip)
                     new += 1
             truncated = truncated or chunk_truncated
-            logger.info(f"[nebula] chunk {chunk_since:%Y-%m-%d %H:%M} -> {chunk_until:%Y-%m-%d %H:%M}: "
+            logger.info(f"[{tag}] chunk {chunk_since:%Y-%m-%d %H:%M} -> {chunk_until:%Y-%m-%d %H:%M}: "
                         f"{len(chunk_ips)} new IP(s), {new} not seen in earlier chunks")
-        if len(ips) > MAX_IPS_PER_RUN:
-            ips = ips[:MAX_IPS_PER_RUN]
+        if len(ips) > cap:
+            ips = ips[:cap]
             truncated = True
         if truncated:
-            logger.warning(f"[nebula] MAX_IPS_PER_RUN={MAX_IPS_PER_RUN} reached; the rest is picked up next run")
+            logger.warning(f"[{tag}] cap {cap} or budget reached; the rest is picked up next run")
         window = {
             "since": since.isoformat(), "until": until.isoformat(),
             "lookback_days": round((until - since).total_seconds() / 86400, 3), "chunks": len(chunks),
         }
-        return self.run_work_list(ips, source="nebula", mode=mode, window=window,
-                                  truncated=truncated, started_at=started)
+        worklist_file = "worklist.txt" if phase == "recent" else f"worklist_{phase}.txt"
+        return self.run_work_list(ips, source="nebula", mode=mode, window=window, truncated=truncated,
+                                  started_at=started, deadline=deadline, worklist_file=worklist_file,
+                                  log_tag=tag)
+
+    def run_nightly(self, now: Optional[datetime] = None, mode: str = "once") -> Dict[str, Any]:
+        """The scheduled job: the recent window at full cap, then the sweep phase.
+
+        The sweep repairs [now - SWEEP_LOOKBACK_DAYS, recent_since) oldest-first under
+        SWEEP_MAX_IPS_PER_RUN and SWEEP_MAX_SECONDS, so anything the recent window missed
+        drains over the following nights without a second CronJob. A sweep whose work-list
+        query fails is recorded, not fatal: the recent phase already did tonight's job.
+        """
+        now = now or utcnow()
+        started = time.monotonic()
+        recent_since, recent_until = compute_window(now, LOOKBACK_DAYS)
+        recent = self.run_nebula_window(recent_since, recent_until, mode=mode, phase="recent")
+
+        sweep: Optional[Dict[str, Any]] = None
+        sweep_window = compute_sweep_window(recent_since, now, SWEEP_LOOKBACK_DAYS)
+        if sweep_window is None:
+            logger.info(f"[nebula/sweep] disabled (SWEEP_LOOKBACK_DAYS={SWEEP_LOOKBACK_DAYS})")
+        elif not self.running:
+            logger.info("[nebula/sweep] skipped: shutdown requested during the recent phase")
+        else:
+            sweep_since, sweep_until = sweep_window
+            deadline = time.monotonic() + SWEEP_MAX_SECONDS if SWEEP_MAX_SECONDS > 0 else None
+            try:
+                sweep = self.run_nebula_window(sweep_since, sweep_until, mode=mode, phase="sweep",
+                                               max_ips=SWEEP_MAX_IPS_PER_RUN, deadline=deadline)
+                sweep["budget_exhausted"] = self.last_stop_reason == "deadline"
+                sweep["max_ips"] = SWEEP_MAX_IPS_PER_RUN
+                sweep["max_seconds"] = SWEEP_MAX_SECONDS
+            except WorkListError as exc:
+                logger.error(f"[nebula/sweep] work list failed; the nightly run continues: {exc}")
+                sweep = {
+                    "window": {"since": sweep_since.isoformat(), "until": sweep_until.isoformat()},
+                    "error": str(exc)[:300], "clickhouse_errors": 1,
+                }
+        return merge_summaries(recent, sweep, time.monotonic() - started)
 
     def run_source(self, name: Optional[str] = None, sql: Optional[str] = None) -> Dict[str, Any]:
         """Explicit source: a named preset from config, or an ad-hoc read-only SELECT."""
@@ -282,8 +345,7 @@ class IPInfoCrawler:
         logger.info(f"Continuous mode: window job every {SLEEP_INTERVAL}s")
         while self.running:
             try:
-                since, until = compute_window(utcnow(), LOOKBACK_DAYS)
-                emit_summary(self.run_nebula_window(since, until, mode="continuous"))
+                emit_summary(self.run_nightly(mode="continuous"))
             except AuthError:
                 raise
             except Exception as exc:  # keep the loop alive; the next iteration retries
@@ -314,7 +376,7 @@ def configure_logging() -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="IP Info Crawler")
     parser.add_argument("--once", "--single-run", action="store_true",
-                        help="Run the nebula window job once and exit (default in the CronJob)")
+                        help="Run the nightly job once and exit: recent window, then the sweep phase (default in the CronJob)")
     parser.add_argument("--since", help="Window start, ISO date/datetime (UTC if naive); implies --once")
     parser.add_argument("--until", help="Window end, ISO date/datetime (default: now); implies --once")
     parser.add_argument("--lookback-days", type=int, help=f"Window length when --since is absent (default {LOOKBACK_DAYS})")
@@ -343,7 +405,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         if args.source or args.ips_query:
             summary = crawler.run_source(name=args.source, sql=args.ips_query)
-        elif args.once or args.since or args.until or args.lookback_days:
+        elif args.since or args.until or args.lookback_days:
+            # An explicit window is a single-phase run (backfills, checks); no sweep.
             try:
                 since, until = compute_window(utcnow(), args.lookback_days or LOOKBACK_DAYS, args.since, args.until)
             except ValueError as exc:
@@ -351,6 +414,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 emit_failure("window", str(exc), exit_code=2)
                 return 2
             summary = crawler.run_nebula_window(since, until)
+        elif args.once:
+            summary = crawler.run_nightly()
         else:
             crawler.run_continuous()
             return 0

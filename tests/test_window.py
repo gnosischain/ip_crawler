@@ -66,3 +66,23 @@ def test_thirty_day_window_gives_thirty_daily_chunks():
 def test_chunk_hours_zero_means_single_chunk():
     since, until = compute_window(NOW, 5)
     assert chunk_window(since, until, 0) == [(since, until)]
+
+
+# --- sweep window ---------------------------------------------------------------
+from src.sources import compute_sweep_window  # noqa: E402
+
+
+def test_sweep_window_is_contiguous_with_recent_and_oldest_first():
+    recent_since, _ = compute_window(NOW, 2)
+    sweep = compute_sweep_window(recent_since, NOW, 30)
+    assert sweep == (NOW - timedelta(days=30), recent_since)
+    chunks = chunk_window(*sweep, 24)
+    assert len(chunks) == 28
+    assert chunks[0][0] == NOW - timedelta(days=30)      # oldest chunk first
+    assert chunks[-1][1] == recent_since                 # ends exactly where the recent window starts
+
+
+@pytest.mark.parametrize("days", [0, -1, 1, 2])
+def test_sweep_window_disabled_or_empty(days):
+    recent_since, _ = compute_window(NOW, 2)
+    assert compute_sweep_window(recent_since, NOW, days) is None

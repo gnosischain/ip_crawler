@@ -118,3 +118,63 @@ def test_exit_code_rules():
     assert exit_code_for(partial) == 0
     truncated = build_summary(source="nebula", mode="once", looked_up=10, saved_ok=10, truncated=True)
     assert exit_code_for(truncated) == 0
+
+
+# --- two-phase summaries --------------------------------------------------------
+from src.sources import COUNTER_KEYS, SUMMARY_KEYS, exit_code_for_phases, merge_summaries, phase_view  # noqa: E402
+
+LEGACY_KEYS = (
+    "event", "source", "mode", "window", "candidates", "truncated", "looked_up",
+    "saved_ok", "saved_failed", "lookup_failed", "skipped_existing", "skipped_shutdown",
+    "clickhouse_errors", "duration_s", "dry_run", "exit_code",
+)
+
+
+def test_summary_keys_only_grew_by_phases_at_the_end():
+    assert SUMMARY_KEYS[:-1] == LEGACY_KEYS
+    assert SUMMARY_KEYS[-1] == "phases"
+    assert build_summary(source="nebula", mode="once")["phases"] is None
+
+
+def _phase(**kw):
+    base = dict(source="nebula", mode="once", window={"since": "s", "until": "u"})
+    base.update(kw)
+    s = build_summary(**base)
+    s["exit_code"] = exit_code_for(s)
+    return s
+
+
+def test_merge_summaries_sums_counters_and_nests_phases():
+    recent = _phase(candidates=5, looked_up=5, saved_ok=5, truncated=False, duration_s=3.0)
+    sweep = _phase(candidates=3, looked_up=3, saved_ok=2, lookup_failed=1, truncated=True, duration_s=9.0)
+    merged = merge_summaries(recent, sweep, 12.34)
+    assert list(merged) == list(SUMMARY_KEYS)
+    assert merged["candidates"] == 8 and merged["saved_ok"] == 7 and merged["lookup_failed"] == 1
+    assert merged["truncated"] is False and merged["window"] == recent["window"]   # recent-phase semantics
+    assert merged["duration_s"] == 12.3
+    assert merged["phases"]["sweep"]["truncated"] is True and merged["phases"]["recent"]["candidates"] == 5
+    for view in merged["phases"].values():
+        assert not {"event", "source", "mode", "dry_run", "exit_code", "phases"} & set(view)
+    assert merged["exit_code"] == 0
+    assert set(COUNTER_KEYS) <= set(SUMMARY_KEYS)
+
+
+def test_merge_summaries_without_sweep_keeps_recent_numbers():
+    recent = _phase(candidates=2, looked_up=2, saved_ok=2)
+    merged = merge_summaries(recent, None, 1.0)
+    assert merged["candidates"] == 2 and merged["phases"]["sweep"] is None
+    assert phase_view(None) is None
+
+
+def test_exit_code_for_phases_rules():
+    healthy = _phase(looked_up=30, saved_ok=30)
+    small_all_failed = _phase(looked_up=MIN_ATTEMPTED_FOR_TOTAL_FAILURE - 1, saved_ok=0)
+    big_all_failed = _phase(looked_up=MIN_ATTEMPTED_FOR_TOTAL_FAILURE, saved_ok=0)
+    assert merge_summaries(healthy, small_all_failed, 1)["exit_code"] == 0
+    assert merge_summaries(small_all_failed, big_all_failed, 1)["exit_code"] == 1        # sweep alone is proof
+    half = _phase(looked_up=10, saved_ok=0)
+    assert merge_summaries(half, half, 1)["exit_code"] == 1                              # only together they cross 20
+    error_sweep = {"error": "boom", "clickhouse_errors": 1}
+    merged = merge_summaries(healthy, error_sweep, 1)
+    assert merged["exit_code"] == 0 and merged["clickhouse_errors"] == 1
+    assert merged["phases"]["sweep"]["error"] == "boom"

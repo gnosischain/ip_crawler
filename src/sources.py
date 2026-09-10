@@ -63,6 +63,23 @@ def compute_window(
     return since_dt, until_dt
 
 
+def compute_sweep_window(
+    recent_since: datetime, now: datetime, sweep_lookback_days: int
+) -> Optional[Tuple[datetime, datetime]]:
+    """The half-open window the sweep phase repairs: [now - sweep_lookback_days, recent_since).
+
+    Anchored on the recent phase's start so the two phases are contiguous and never
+    overlap. None when disabled (days <= 0) or when it would be empty.
+    """
+    if sweep_lookback_days <= 0:
+        return None
+    since = now.astimezone(timezone.utc) - timedelta(days=sweep_lookback_days)
+    until = recent_since.astimezone(timezone.utc)
+    if since >= until:
+        return None
+    return since, until
+
+
 def chunk_window(since: datetime, until: datetime, chunk_hours: int) -> List[Tuple[datetime, datetime]]:
     """Split [since, until) into consecutive half-open chunks of at most `chunk_hours`.
 
@@ -151,7 +168,15 @@ SUMMARY_KEYS = (
     "event", "source", "mode", "window", "candidates", "truncated", "looked_up",
     "saved_ok", "saved_failed", "lookup_failed", "skipped_existing", "skipped_shutdown",
     "clickhouse_errors", "duration_s", "dry_run", "exit_code",
+    "phases",  # appended last, 2026-09: per-phase detail of a two-phase nightly run, else None
 )
+
+# Keys summed across phases by merge_summaries.
+COUNTER_KEYS = (
+    "candidates", "looked_up", "saved_ok", "saved_failed", "lookup_failed",
+    "skipped_existing", "skipped_shutdown", "clickhouse_errors",
+)
+_PHASE_VIEW_DROP = frozenset({"event", "source", "mode", "dry_run", "exit_code", "phases"})
 
 
 def build_summary(**fields: Any) -> Dict[str, Any]:
@@ -163,7 +188,7 @@ def build_summary(**fields: Any) -> Dict[str, Any]:
     for key in SUMMARY_KEYS:
         if key == "event":
             continue
-        summary[key] = fields.get(key, 0 if key not in ("source", "mode", "window") else None)
+        summary[key] = fields.get(key, 0 if key not in ("source", "mode", "window", "phases") else None)
     for flag in ("truncated", "dry_run"):
         summary[flag] = bool(summary[flag])
     return summary
@@ -176,3 +201,37 @@ def exit_code_for(summary: Dict[str, Any], fatal: bool = False) -> int:
     if summary.get("looked_up", 0) >= MIN_ATTEMPTED_FOR_TOTAL_FAILURE and summary.get("saved_ok", 0) == 0:
         return 1
     return 0
+
+
+def phase_view(summary: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """A phase's own numbers without the run-level fields (event, mode, exit code...)."""
+    if summary is None:
+        return None
+    return {k: v for k, v in summary.items() if k not in _PHASE_VIEW_DROP}
+
+
+def exit_code_for_phases(phases: Sequence[Optional[Dict[str, Any]]], merged: Dict[str, Any]) -> int:
+    """Worst of the merged rule and each phase's own rule.
+
+    A phase whose 20+ lookups all failed is evidence of a broken API on its own; the
+    merged check catches two small phases that only cross the threshold together.
+    """
+    codes = [exit_code_for(merged)] + [exit_code_for(p) for p in phases if p]
+    return max(codes)
+
+
+def merge_summaries(recent: Dict[str, Any], sweep: Optional[Dict[str, Any]], duration_s: float) -> Dict[str, Any]:
+    """One run_summary for a two-phase run.
+
+    Top-level counters are the sums; `window`, `truncated`, `source`, `mode` and `dry_run`
+    describe the recent phase (so an alert on `truncated` keeps meaning "the nightly
+    window itself hit the cap"); each phase's own numbers sit under `phases`.
+    """
+    merged = dict(recent)
+    if sweep:
+        for key in COUNTER_KEYS:
+            merged[key] = int(recent.get(key, 0) or 0) + int(sweep.get(key, 0) or 0)
+    merged["duration_s"] = round(duration_s, 1)
+    merged["phases"] = {"recent": phase_view(recent), "sweep": phase_view(sweep)}
+    merged["exit_code"] = exit_code_for_phases([recent, sweep], merged)
+    return merged
